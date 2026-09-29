@@ -1,5 +1,2 @@
 customtkinter>=5.2.2
-gspread>=6.1.4
-google-api-python-client>=2.149.0
-google-auth>=2.35.0
 Pillow>=10.4.0
