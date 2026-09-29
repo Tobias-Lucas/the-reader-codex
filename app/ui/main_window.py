@@ -1,6 +1,7 @@
 
 import customtkinter as ctk
 from app.components.work_card import WorkCard
+from app.repositories.sqlite_repository import SQLiteWorkRepository
 
 
 class MainWindow(ctk.CTk):
@@ -11,8 +12,33 @@ class MainWindow(ctk.CTk):
         self.geometry("1180x760")
         self.minsize(980, 640)
 
+        self.repo = SQLiteWorkRepository()
+        self._seed_demo()
+
         self._build_shell()
         self.show_home()
+
+    def _seed_demo(self):
+        if self.repo.list_all():
+            return
+
+        self.repo.create(
+            name="Duna",
+            category="Livro",
+            progress_unit="Página",
+            progress_current=241,
+            progress_total=412,
+            status="Lendo",
+        )
+        self.repo.create(
+            name="Frieren",
+            category="Mangá",
+            progress_unit="Capítulo",
+            progress_current=128,
+            progress_total=140,
+            status="Lendo",
+            release_day="Terça-feira",
+        )
 
     def _build_shell(self):
         self.grid_columnconfigure(1, weight=1)
@@ -31,7 +57,6 @@ class MainWindow(ctk.CTk):
         for text, command in [
             ("🏠  Início", self.show_home),
             ("📚  Biblioteca", self.show_library),
-            ("📅  Agenda", self.show_schedule),
             ("🕘  Histórico", self.show_history),
         ]:
             ctk.CTkButton(
@@ -42,15 +67,13 @@ class MainWindow(ctk.CTk):
                 height=42,
             ).pack(fill="x", padx=14, pady=6)
 
-        ctk.CTkButton(
+        ctk.CTkLabel(
             self.sidebar,
-            text="⚙️  Configurações",
-            anchor="w",
-            command=self.show_settings,
-            height=42,
-        ).pack(side="bottom", fill="x", padx=14, pady=18)
+            text="● Modo local",
+            text_color=("gray35", "gray70"),
+        ).pack(side="bottom", pady=18)
 
-        self.content = ctk.CTkFrame(self, fg_color="transparent")
+        self.content = ctk.CTkScrollableFrame(self, fg_color="transparent")
         self.content.grid(row=0, column=1, sticky="nsew", padx=24, pady=20)
 
     def _clear_content(self):
@@ -71,11 +94,38 @@ class MainWindow(ctk.CTk):
             anchor="w",
         ).pack(fill="x", pady=(4, 18))
 
+    def _render_work(self, work):
+        total = work.progress_total or 0
+        percent = (
+            work.progress_current / total
+            if total and total > 0
+            else 0
+        )
+        progress_text = (
+            f"{work.progress_current} / {work.progress_total} {work.progress_unit.lower()}s"
+            if work.progress_total
+            else f"{work.progress_unit}: {work.progress_current}"
+        )
+
+        WorkCard(
+            self.content,
+            title=work.name,
+            category=work.category,
+            progress_text=progress_text,
+            status=work.status,
+            percent=percent,
+            on_increment=lambda wid=work.id: self._increment(wid),
+        ).pack(fill="x", pady=7)
+
+    def _increment(self, work_id):
+        self.repo.increment_progress(work_id)
+        self.show_library()
+
     def show_home(self):
         self._clear_content()
         self._header(
             "Início",
-            "Continue de onde parou e acompanhe seus próximos lançamentos.",
+            "Sua biblioteca agora funciona mesmo sem internet.",
         )
 
         ctk.CTkLabel(
@@ -85,89 +135,42 @@ class MainWindow(ctk.CTk):
             anchor="w",
         ).pack(fill="x", pady=(8, 10))
 
-        WorkCard(
-            self.content,
-            title="Duna",
-            category="Livro",
-            progress_text="241 / 412 páginas",
-            status="Lendo",
-            percent=0.58,
-        ).pack(fill="x", pady=8)
-
-        ctk.CTkLabel(
-            self.content,
-            text="Lançamentos de hoje",
-            font=("Arial", 18, "bold"),
-            anchor="w",
-        ).pack(fill="x", pady=(24, 10))
-
-        empty = ctk.CTkFrame(self.content)
-        empty.pack(fill="x")
-        ctk.CTkLabel(
-            empty,
-            text="Nenhum lançamento programado para hoje.",
-        ).pack(pady=24)
+        works = self.repo.list_all()
+        if works:
+            self._render_work(works[0])
 
     def show_library(self):
         self._clear_content()
         self._header(
             "Biblioteca",
-            "Pesquise, filtre e atualize o progresso das suas leituras.",
+            "Dados carregados do SQLite local.",
         )
 
-        toolbar = ctk.CTkFrame(self.content, fg_color="transparent")
-        toolbar.pack(fill="x", pady=(0, 14))
-
-        ctk.CTkEntry(
-            toolbar,
-            placeholder_text="🔍 Buscar na biblioteca...",
-            width=360,
-        ).pack(side="left")
-
-        ctk.CTkButton(
-            toolbar,
-            text="+ Adicionar obra",
-            width=150,
-        ).pack(side="right")
-
-        for data in [
-            ("Frieren", "Mangá", "128 / 140 capítulos", "Lendo", 0.91),
-            ("Duna", "Livro", "241 / 412 páginas", "Lendo", 0.58),
-            ("Berserk", "Mangá", "241 / 380 capítulos", "Pausado", 0.63),
-        ]:
-            WorkCard(
-                self.content,
-                title=data[0],
-                category=data[1],
-                progress_text=data[2],
-                status=data[3],
-                percent=data[4],
-            ).pack(fill="x", pady=7)
-
-    def show_schedule(self):
-        self._clear_content()
-        self._header("Agenda", "Visualize os próximos lançamentos.")
-        ctk.CTkLabel(
-            self.content,
-            text="Terça-feira\n• Frieren\n\nQuinta-feira\n• Kaiju No. 8",
-            justify="left",
-            anchor="w",
-        ).pack(fill="x")
+        for work in self.repo.list_all():
+            self._render_work(work)
 
     def show_history(self):
         self._clear_content()
-        self._header("Histórico", "Acompanhe seus avanços recentes.")
-        ctk.CTkLabel(
-            self.content,
-            text="Hoje  • Duna: página 230 → 241\nOntem • Frieren: capítulo 127 → 128",
-            justify="left",
-            anchor="w",
-        ).pack(fill="x")
+        self._header("Histórico", "Avanços registrados localmente.")
 
-    def show_settings(self):
-        self._clear_content()
-        self._header("Configurações", "Preferências do aplicativo.")
-        ctk.CTkLabel(
-            self.content,
-            text="Persistência local e sincronização serão introduzidas na próxima versão.",
-        ).pack(anchor="w")
+        with self.repo._connect() as conn:
+            rows = conn.execute("""
+                SELECT h.created_at, h.description, w.name
+                FROM history h
+                JOIN works w ON w.id = h.work_id
+                ORDER BY h.created_at DESC
+            """).fetchall()
+
+        if not rows:
+            ctk.CTkLabel(
+                self.content,
+                text="Ainda não há registros de progresso.",
+            ).pack(anchor="w")
+            return
+
+        for row in rows:
+            ctk.CTkLabel(
+                self.content,
+                text=f"{row['name']} • {row['description']}",
+                anchor="w",
+            ).pack(fill="x", pady=4)

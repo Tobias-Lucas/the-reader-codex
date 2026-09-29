@@ -11,6 +11,7 @@ class WorkCard(ctk.CTkFrame):
         progress_text,
         status,
         percent=0,
+        on_increment=None,
     ):
         super().__init__(master)
 
@@ -49,4 +50,5 @@ class WorkCard(ctk.CTkFrame):
             self,
             text="+1",
             width=54,
+            command=on_increment,
         ).grid(row=1, column=2, padx=14)
