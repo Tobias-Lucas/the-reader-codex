@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .venv/
 data/*.db
+data/remote_simulated.json
+credentials.json
+config.json

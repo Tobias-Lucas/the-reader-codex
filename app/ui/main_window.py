@@ -1,7 +1,10 @@
 
+import threading
 import customtkinter as ctk
+
 from app.components.work_card import WorkCard
 from app.repositories.sqlite_repository import SQLiteWorkRepository
+from app.services.sync_engine import SyncEngine
 
 
 class MainWindow(ctk.CTk):
@@ -13,10 +16,12 @@ class MainWindow(ctk.CTk):
         self.minsize(980, 640)
 
         self.repo = SQLiteWorkRepository()
-        self._seed_demo()
+        self.sync_engine = SyncEngine(self.repo)
 
+        self._seed_demo()
         self._build_shell()
         self.show_home()
+        self.after(1500, self.sync_in_background)
 
     def _seed_demo(self):
         if self.repo.list_all():
@@ -67,11 +72,19 @@ class MainWindow(ctk.CTk):
                 height=42,
             ).pack(fill="x", padx=14, pady=6)
 
-        ctk.CTkLabel(
+        self.sync_label = ctk.CTkLabel(
             self.sidebar,
-            text="● Modo local",
+            text="☁ Verificando sincronização...",
             text_color=("gray35", "gray70"),
-        ).pack(side="bottom", pady=18)
+            wraplength=180,
+        )
+        self.sync_label.pack(side="bottom", pady=(0, 18))
+
+        ctk.CTkButton(
+            self.sidebar,
+            text="Sincronizar agora",
+            command=self.sync_in_background,
+        ).pack(side="bottom", padx=14, pady=8)
 
         self.content = ctk.CTkScrollableFrame(self, fg_color="transparent")
         self.content.grid(row=0, column=1, sticky="nsew", padx=24, pady=20)
@@ -87,6 +100,7 @@ class MainWindow(ctk.CTk):
             font=("Arial", 28, "bold"),
             anchor="w",
         ).pack(fill="x")
+
         ctk.CTkLabel(
             self.content,
             text=subtitle,
@@ -101,6 +115,7 @@ class MainWindow(ctk.CTk):
             if total and total > 0
             else 0
         )
+
         progress_text = (
             f"{work.progress_current} / {work.progress_total} {work.progress_unit.lower()}s"
             if work.progress_total
@@ -125,7 +140,7 @@ class MainWindow(ctk.CTk):
         self._clear_content()
         self._header(
             "Início",
-            "Sua biblioteca agora funciona mesmo sem internet.",
+            "Local-first: use normalmente mesmo sem internet.",
         )
 
         ctk.CTkLabel(
@@ -143,7 +158,7 @@ class MainWindow(ctk.CTk):
         self._clear_content()
         self._header(
             "Biblioteca",
-            "Dados carregados do SQLite local.",
+            "SQLite local com sincronização desacoplada.",
         )
 
         for work in self.repo.list_all():
@@ -151,7 +166,7 @@ class MainWindow(ctk.CTk):
 
     def show_history(self):
         self._clear_content()
-        self._header("Histórico", "Avanços registrados localmente.")
+        self._header("Histórico", "Seus avanços recentes.")
 
         with self.repo._connect() as conn:
             rows = conn.execute("""
@@ -164,7 +179,7 @@ class MainWindow(ctk.CTk):
         if not rows:
             ctk.CTkLabel(
                 self.content,
-                text="Ainda não há registros de progresso.",
+                text="Ainda não há registros.",
             ).pack(anchor="w")
             return
 
@@ -174,3 +189,26 @@ class MainWindow(ctk.CTk):
                 text=f"{row['name']} • {row['description']}",
                 anchor="w",
             ).pack(fill="x", pady=4)
+
+    def sync_in_background(self):
+        self.sync_label.configure(text="☁ Sincronizando...")
+
+        def worker():
+            result = self.sync_engine.sync()
+            self.after(0, lambda: self._apply_sync_result(result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_sync_result(self, result):
+        if result["status"] == "offline":
+            self.sync_label.configure(
+                text="○ Offline\nAlterações ficam salvas localmente."
+            )
+            return
+
+        self.sync_label.configure(
+            text=(
+                "☁ Sincronizado\n"
+                f"{result['uploaded']} envio(s)"
+            )
+        )
