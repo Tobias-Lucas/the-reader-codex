@@ -1,8 +1,8 @@
-
 import os
 import sqlite3
 import uuid
 from datetime import datetime, timezone
+
 from app.models.work import Work
 
 
@@ -31,24 +31,35 @@ class SQLiteWorkRepository:
                     release_day TEXT,
                     synopsis TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    deleted_at TEXT,
+                    sync_status TEXT NOT NULL DEFAULT 'PENDING_CREATE'
                 )
             """)
+
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS history (
                     id TEXT PRIMARY KEY,
                     work_id TEXT NOT NULL,
                     description TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    FOREIGN KEY(work_id) REFERENCES works(id)
+                    sync_status TEXT NOT NULL DEFAULT 'PENDING_CREATE'
                 )
             """)
 
     def list_all(self):
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM works ORDER BY updated_at DESC"
-            ).fetchall()
+            rows = conn.execute("""
+                SELECT
+                    id, name, category, progress_unit,
+                    progress_current, progress_total,
+                    status, release_day, synopsis,
+                    created_at, updated_at
+                FROM works
+                WHERE deleted_at IS NULL
+                ORDER BY updated_at DESC
+            """).fetchall()
+
         return [Work(**dict(row)) for row in rows]
 
     def create(
@@ -61,10 +72,13 @@ class SQLiteWorkRepository:
         status="Quero ler",
         release_day=None,
         synopsis="",
+        work_id=None,
+        created_at=None,
+        updated_at=None,
     ):
         now = datetime.now(timezone.utc).isoformat()
         work = Work(
-            id=str(uuid.uuid4()),
+            id=work_id or str(uuid.uuid4()),
             name=name,
             category=category,
             progress_unit=progress_unit,
@@ -73,8 +87,8 @@ class SQLiteWorkRepository:
             status=status,
             release_day=release_day,
             synopsis=synopsis,
-            created_at=now,
-            updated_at=now,
+            created_at=created_at or now,
+            updated_at=updated_at or now,
         )
 
         with self._connect() as conn:
@@ -82,9 +96,10 @@ class SQLiteWorkRepository:
                 INSERT INTO works (
                     id, name, category, progress_unit,
                     progress_current, progress_total, status,
-                    release_day, synopsis, created_at, updated_at
+                    release_day, synopsis, created_at,
+                    updated_at, sync_status
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_CREATE')
             """, (
                 work.id,
                 work.name,
@@ -115,18 +130,94 @@ class SQLiteWorkRepository:
             new_value = old_value + amount
             now = datetime.now(timezone.utc).isoformat()
 
-            conn.execute("""
-                UPDATE works
-                SET progress_current = ?, updated_at = ?
-                WHERE id = ?
-            """, (new_value, now, work_id))
+            current_sync = row["sync_status"]
+            next_sync = (
+                "PENDING_CREATE"
+                if current_sync == "PENDING_CREATE"
+                else "PENDING_UPDATE"
+            )
 
             conn.execute("""
-                INSERT INTO history (id, work_id, description, created_at)
-                VALUES (?, ?, ?, ?)
+                UPDATE works
+                SET progress_current = ?,
+                    updated_at = ?,
+                    sync_status = ?
+                WHERE id = ?
+            """, (new_value, now, next_sync, work_id))
+
+            conn.execute("""
+                INSERT INTO history (
+                    id, work_id, description,
+                    created_at, sync_status
+                )
+                VALUES (?, ?, ?, ?, 'PENDING_CREATE')
             """, (
                 str(uuid.uuid4()),
                 work_id,
                 f"Progresso: {old_value} → {new_value}",
                 now,
             ))
+
+    def export_payload(self):
+        with self._connect() as conn:
+            works = [
+                dict(row)
+                for row in conn.execute("SELECT * FROM works").fetchall()
+            ]
+            history = [
+                dict(row)
+                for row in conn.execute("SELECT * FROM history").fetchall()
+            ]
+        return {
+            "schema_version": 1,
+            "works": works,
+            "history": history,
+        }
+
+    def replace_from_payload(self, payload):
+        works = payload.get("works", [])
+        history = payload.get("history", [])
+
+        with self._connect() as conn:
+            conn.execute("DELETE FROM history")
+            conn.execute("DELETE FROM works")
+
+            for item in works:
+                conn.execute("""
+                    INSERT INTO works (
+                        id, name, category, progress_unit,
+                        progress_current, progress_total, status,
+                        release_day, synopsis, created_at, updated_at,
+                        deleted_at, sync_status
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    item["id"],
+                    item["name"],
+                    item["category"],
+                    item["progress_unit"],
+                    item.get("progress_current", 0),
+                    item.get("progress_total"),
+                    item.get("status", "Quero ler"),
+                    item.get("release_day"),
+                    item.get("synopsis", ""),
+                    item["created_at"],
+                    item["updated_at"],
+                    item.get("deleted_at"),
+                    item.get("sync_status", "SYNCED"),
+                ))
+
+            for item in history:
+                conn.execute("""
+                    INSERT INTO history (
+                        id, work_id, description,
+                        created_at, sync_status
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                """, (
+                    item["id"],
+                    item["work_id"],
+                    item["description"],
+                    item["created_at"],
+                    item.get("sync_status", "SYNCED"),
+                ))

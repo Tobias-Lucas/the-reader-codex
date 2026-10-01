@@ -1,7 +1,12 @@
-
+import os
+import threading
 import customtkinter as ctk
+from tkinter import filedialog, messagebox
+
 from app.components.work_card import WorkCard
 from app.repositories.sqlite_repository import SQLiteWorkRepository
+from app.services.backup_service import BackupService
+from app.services.sync_engine import SyncEngine
 
 
 class MainWindow(ctk.CTk):
@@ -13,10 +18,15 @@ class MainWindow(ctk.CTk):
         self.minsize(980, 640)
 
         self.repo = SQLiteWorkRepository()
-        self._seed_demo()
+        self.sync_engine = SyncEngine(self.repo)
+        self.backup_service = BackupService(self.repo)
 
+        self._seed_demo()
         self._build_shell()
         self.show_home()
+
+        self.after(1500, self.sync_in_background)
+        self.after(2500, self._startup_backup)
 
     def _seed_demo(self):
         if self.repo.list_all():
@@ -30,6 +40,7 @@ class MainWindow(ctk.CTk):
             progress_total=412,
             status="Lendo",
         )
+
         self.repo.create(
             name="Frieren",
             category="Mangá",
@@ -44,7 +55,11 @@ class MainWindow(ctk.CTk):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        self.sidebar = ctk.CTkFrame(self, width=220, corner_radius=0)
+        self.sidebar = ctk.CTkFrame(
+            self,
+            width=220,
+            corner_radius=0,
+        )
         self.sidebar.grid(row=0, column=0, sticky="nsw")
         self.sidebar.grid_propagate(False)
 
@@ -58,6 +73,7 @@ class MainWindow(ctk.CTk):
             ("🏠  Início", self.show_home),
             ("📚  Biblioteca", self.show_library),
             ("🕘  Histórico", self.show_history),
+            ("💾  Backup", self.show_backup),
         ]:
             ctk.CTkButton(
                 self.sidebar,
@@ -67,14 +83,25 @@ class MainWindow(ctk.CTk):
                 height=42,
             ).pack(fill="x", padx=14, pady=6)
 
-        ctk.CTkLabel(
+        self.sync_label = ctk.CTkLabel(
             self.sidebar,
-            text="● Modo local",
+            text="☁ Verificando sincronização...",
             text_color=("gray35", "gray70"),
-        ).pack(side="bottom", pady=18)
+            wraplength=180,
+        )
+        self.sync_label.pack(side="bottom", pady=(0, 18))
 
-        self.content = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        self.content.grid(row=0, column=1, sticky="nsew", padx=24, pady=20)
+        self.content = ctk.CTkScrollableFrame(
+            self,
+            fg_color="transparent",
+        )
+        self.content.grid(
+            row=0,
+            column=1,
+            sticky="nsew",
+            padx=24,
+            pady=20,
+        )
 
     def _clear_content(self):
         for child in self.content.winfo_children():
@@ -87,6 +114,7 @@ class MainWindow(ctk.CTk):
             font=("Arial", 28, "bold"),
             anchor="w",
         ).pack(fill="x")
+
         ctk.CTkLabel(
             self.content,
             text=subtitle,
@@ -101,8 +129,11 @@ class MainWindow(ctk.CTk):
             if total and total > 0
             else 0
         )
+
         progress_text = (
-            f"{work.progress_current} / {work.progress_total} {work.progress_unit.lower()}s"
+            f"{work.progress_current} / "
+            f"{work.progress_total} "
+            f"{work.progress_unit.lower()}s"
             if work.progress_total
             else f"{work.progress_unit}: {work.progress_current}"
         )
@@ -125,15 +156,8 @@ class MainWindow(ctk.CTk):
         self._clear_content()
         self._header(
             "Início",
-            "Sua biblioteca agora funciona mesmo sem internet.",
+            "Local-first com backup e portabilidade dos dados.",
         )
-
-        ctk.CTkLabel(
-            self.content,
-            text="Continue lendo",
-            font=("Arial", 18, "bold"),
-            anchor="w",
-        ).pack(fill="x", pady=(8, 10))
 
         works = self.repo.list_all()
         if works:
@@ -143,7 +167,7 @@ class MainWindow(ctk.CTk):
         self._clear_content()
         self._header(
             "Biblioteca",
-            "Dados carregados do SQLite local.",
+            "Dados armazenados localmente em SQLite.",
         )
 
         for work in self.repo.list_all():
@@ -151,7 +175,7 @@ class MainWindow(ctk.CTk):
 
     def show_history(self):
         self._clear_content()
-        self._header("Histórico", "Avanços registrados localmente.")
+        self._header("Histórico", "Avanços recentes.")
 
         with self.repo._connect() as conn:
             rows = conn.execute("""
@@ -164,7 +188,7 @@ class MainWindow(ctk.CTk):
         if not rows:
             ctk.CTkLabel(
                 self.content,
-                text="Ainda não há registros de progresso.",
+                text="Ainda não há registros.",
             ).pack(anchor="w")
             return
 
@@ -174,3 +198,110 @@ class MainWindow(ctk.CTk):
                 text=f"{row['name']} • {row['description']}",
                 anchor="w",
             ).pack(fill="x", pady=4)
+
+    def show_backup(self):
+        self._clear_content()
+        self._header(
+            "Backup e dados",
+            "Exporte, importe ou crie uma cópia de segurança.",
+        )
+
+        ctk.CTkButton(
+            self.content,
+            text="Exportar biblioteca para JSON",
+            command=self.export_json,
+        ).pack(anchor="w", pady=6)
+
+        ctk.CTkButton(
+            self.content,
+            text="Importar biblioteca de JSON",
+            command=self.import_json,
+        ).pack(anchor="w", pady=6)
+
+        ctk.CTkButton(
+            self.content,
+            text="Criar backup agora",
+            command=self.manual_backup,
+        ).pack(anchor="w", pady=6)
+
+        ctk.CTkLabel(
+            self.content,
+            text=(
+                "O sistema também cria backup automático "
+                "ao iniciar a aplicação."
+            ),
+            text_color=("gray35", "gray70"),
+        ).pack(anchor="w", pady=(12, 0))
+
+    def export_json(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json")],
+            initialfile="the-reader-codex-export.json",
+        )
+        if not path:
+            return
+
+        self.backup_service.export_json(path)
+        messagebox.showinfo(
+            "Exportação concluída",
+            f"Dados exportados para:\n{path}",
+        )
+
+    def import_json(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("JSON", "*.json")]
+        )
+        if not path:
+            return
+
+        if not messagebox.askyesno(
+            "Importar dados",
+            "A importação substituirá os dados locais atuais. Continuar?",
+        ):
+            return
+
+        self.backup_service.create_automatic_backup()
+        self.backup_service.import_json(path)
+        messagebox.showinfo(
+            "Importação concluída",
+            "Os dados foram importados com sucesso.",
+        )
+        self.show_library()
+
+    def manual_backup(self):
+        result = self.backup_service.create_automatic_backup()
+        messagebox.showinfo(
+            "Backup criado",
+            f"Backup JSON:\n{result['json']}",
+        )
+
+    def _startup_backup(self):
+        try:
+            self.backup_service.create_automatic_backup()
+        except Exception as exc:
+            print(f"Falha ao criar backup automático: {exc}")
+
+    def sync_in_background(self):
+        self.sync_label.configure(text="☁ Sincronizando...")
+
+        def worker():
+            result = self.sync_engine.sync()
+            self.after(
+                0,
+                lambda: self._apply_sync_result(result),
+            )
+
+        threading.Thread(
+            target=worker,
+            daemon=True,
+        ).start()
+
+    def _apply_sync_result(self, result):
+        if result["status"] == "offline":
+            self.sync_label.configure(
+                text="○ Offline\nDados protegidos localmente."
+            )
+            return
+
+        self.sync_label.configure(text="☁ Sincronizado")
