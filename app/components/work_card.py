@@ -1,4 +1,3 @@
-
 import customtkinter as ctk
 
 
@@ -12,15 +11,18 @@ class WorkCard(ctk.CTkFrame):
         status,
         percent=0,
         on_increment=None,
+        extra_text="",
     ):
         super().__init__(master)
 
         self.grid_columnconfigure(1, weight=1)
 
         cover = ctk.CTkFrame(self, width=72, height=96)
-        cover.grid(row=0, column=0, rowspan=3, padx=14, pady=14)
+        cover.grid(row=0, column=0, rowspan=4, padx=14, pady=14)
         cover.grid_propagate(False)
-        ctk.CTkLabel(cover, text="CAPA").place(relx=0.5, rely=0.5, anchor="center")
+        ctk.CTkLabel(cover, text="CAPA").place(
+            relx=0.5, rely=0.5, anchor="center"
+        )
 
         ctk.CTkLabel(
             self,
@@ -38,13 +40,27 @@ class WorkCard(ctk.CTkFrame):
 
         progress = ctk.CTkProgressBar(self)
         progress.set(max(0, min(percent, 1)))
-        progress.grid(row=2, column=1, sticky="ew", padx=(0, 14), pady=(6, 4))
+        progress.grid(
+            row=2,
+            column=1,
+            sticky="ew",
+            padx=(0, 14),
+            pady=(6, 4),
+        )
 
         ctk.CTkLabel(
             self,
             text=progress_text,
             anchor="w",
-        ).grid(row=3, column=1, sticky="w", padx=(0, 14), pady=(0, 14))
+        ).grid(row=3, column=1, sticky="w", padx=(0, 14), pady=(0, 4))
+
+        if extra_text:
+            ctk.CTkLabel(
+                self,
+                text=extra_text,
+                anchor="w",
+                text_color=("gray35", "gray70"),
+            ).grid(row=4, column=1, sticky="w", padx=(0, 14), pady=(0, 12))
 
         ctk.CTkButton(
             self,

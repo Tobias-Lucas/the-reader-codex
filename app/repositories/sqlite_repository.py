@@ -1,8 +1,8 @@
-
 import os
 import sqlite3
 import uuid
 from datetime import datetime, timezone
+
 from app.models.work import Work
 
 
@@ -36,6 +36,7 @@ class SQLiteWorkRepository:
                     sync_status TEXT NOT NULL DEFAULT 'PENDING_CREATE'
                 )
             """)
+
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS history (
                     id TEXT PRIMARY KEY,
@@ -58,6 +59,7 @@ class SQLiteWorkRepository:
                 WHERE deleted_at IS NULL
                 ORDER BY updated_at DESC
             """).fetchall()
+
         return [Work(**dict(row)) for row in rows]
 
     def create(
@@ -70,10 +72,13 @@ class SQLiteWorkRepository:
         status="Quero ler",
         release_day=None,
         synopsis="",
+        work_id=None,
+        created_at=None,
+        updated_at=None,
     ):
         now = datetime.now(timezone.utc).isoformat()
         work = Work(
-            id=str(uuid.uuid4()),
+            id=work_id or str(uuid.uuid4()),
             name=name,
             category=category,
             progress_unit=progress_unit,
@@ -82,8 +87,8 @@ class SQLiteWorkRepository:
             status=status,
             release_day=release_day,
             synopsis=synopsis,
-            created_at=now,
-            updated_at=now,
+            created_at=created_at or now,
+            updated_at=updated_at or now,
         )
 
         with self._connect() as conn:
@@ -91,8 +96,8 @@ class SQLiteWorkRepository:
                 INSERT INTO works (
                     id, name, category, progress_unit,
                     progress_current, progress_total, status,
-                    release_day, synopsis, created_at, updated_at,
-                    sync_status
+                    release_day, synopsis, created_at,
+                    updated_at, sync_status
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_CREATE')
             """, (
@@ -153,29 +158,31 @@ class SQLiteWorkRepository:
                 now,
             ))
 
-    def get_pending_works(self):
+    def export_payload(self):
         with self._connect() as conn:
-            return conn.execute("""
-                SELECT * FROM works
-                WHERE sync_status <> 'SYNCED'
-            """).fetchall()
+            works = [
+                dict(row)
+                for row in conn.execute("SELECT * FROM works").fetchall()
+            ]
+            history = [
+                dict(row)
+                for row in conn.execute("SELECT * FROM history").fetchall()
+            ]
+        return {
+            "schema_version": 1,
+            "works": works,
+            "history": history,
+        }
 
-    def mark_work_synced(self, work_id):
+    def replace_from_payload(self, payload):
+        works = payload.get("works", [])
+        history = payload.get("history", [])
+
         with self._connect() as conn:
-            conn.execute("""
-                UPDATE works
-                SET sync_status = 'SYNCED'
-                WHERE id = ?
-            """, (work_id,))
+            conn.execute("DELETE FROM history")
+            conn.execute("DELETE FROM works")
 
-    def upsert_remote(self, payload):
-        with self._connect() as conn:
-            local = conn.execute(
-                "SELECT * FROM works WHERE id = ?",
-                (payload["id"],),
-            ).fetchone()
-
-            if local is None:
+            for item in works:
                 conn.execute("""
                     INSERT INTO works (
                         id, name, category, progress_unit,
@@ -183,48 +190,34 @@ class SQLiteWorkRepository:
                         release_day, synopsis, created_at, updated_at,
                         deleted_at, sync_status
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SYNCED')
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    payload["id"],
-                    payload["name"],
-                    payload["category"],
-                    payload["progress_unit"],
-                    payload["progress_current"],
-                    payload.get("progress_total"),
-                    payload["status"],
-                    payload.get("release_day"),
-                    payload.get("synopsis", ""),
-                    payload["created_at"],
-                    payload["updated_at"],
-                    payload.get("deleted_at"),
+                    item["id"],
+                    item["name"],
+                    item["category"],
+                    item["progress_unit"],
+                    item.get("progress_current", 0),
+                    item.get("progress_total"),
+                    item.get("status", "Quero ler"),
+                    item.get("release_day"),
+                    item.get("synopsis", ""),
+                    item["created_at"],
+                    item["updated_at"],
+                    item.get("deleted_at"),
+                    item.get("sync_status", "SYNCED"),
                 ))
-                return
 
-            if payload["updated_at"] > local["updated_at"]:
+            for item in history:
                 conn.execute("""
-                    UPDATE works SET
-                        name = ?,
-                        category = ?,
-                        progress_unit = ?,
-                        progress_current = ?,
-                        progress_total = ?,
-                        status = ?,
-                        release_day = ?,
-                        synopsis = ?,
-                        updated_at = ?,
-                        deleted_at = ?,
-                        sync_status = 'SYNCED'
-                    WHERE id = ?
+                    INSERT INTO history (
+                        id, work_id, description,
+                        created_at, sync_status
+                    )
+                    VALUES (?, ?, ?, ?, ?)
                 """, (
-                    payload["name"],
-                    payload["category"],
-                    payload["progress_unit"],
-                    payload["progress_current"],
-                    payload.get("progress_total"),
-                    payload["status"],
-                    payload.get("release_day"),
-                    payload.get("synopsis", ""),
-                    payload["updated_at"],
-                    payload.get("deleted_at"),
-                    payload["id"],
+                    item["id"],
+                    item["work_id"],
+                    item["description"],
+                    item["created_at"],
+                    item.get("sync_status", "SYNCED"),
                 ))
