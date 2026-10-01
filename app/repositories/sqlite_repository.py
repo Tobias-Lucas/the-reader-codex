@@ -30,10 +30,21 @@ class SQLiteWorkRepository:
                     status TEXT NOT NULL DEFAULT 'Quero ler',
                     release_day TEXT,
                     synopsis TEXT NOT NULL DEFAULT '',
+                    rating INTEGER,
+                    favorite INTEGER NOT NULL DEFAULT 0,
+                    personal_notes TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     deleted_at TEXT,
                     sync_status TEXT NOT NULL DEFAULT 'PENDING_CREATE'
+                )
+            """)
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS work_tags (
+                    work_id TEXT NOT NULL,
+                    tag TEXT NOT NULL,
+                    PRIMARY KEY (work_id, tag)
                 )
             """)
 
@@ -47,6 +58,29 @@ class SQLiteWorkRepository:
                 )
             """)
 
+            self._ensure_column(conn, "works", "rating", "INTEGER")
+            self._ensure_column(
+                conn, "works", "favorite",
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+            self._ensure_column(
+                conn, "works", "personal_notes",
+                "TEXT NOT NULL DEFAULT ''"
+            )
+
+    def _ensure_column(self, conn, table, column, definition):
+        columns = {
+            row["name"]
+            for row in conn.execute(
+                f"PRAGMA table_info({table})"
+            ).fetchall()
+        }
+        if column not in columns:
+            conn.execute(
+                f"ALTER TABLE {table} "
+                f"ADD COLUMN {column} {definition}"
+            )
+
     def list_all(self):
         with self._connect() as conn:
             rows = conn.execute("""
@@ -54,13 +88,19 @@ class SQLiteWorkRepository:
                     id, name, category, progress_unit,
                     progress_current, progress_total,
                     status, release_day, synopsis,
+                    rating, favorite, personal_notes,
                     created_at, updated_at
                 FROM works
                 WHERE deleted_at IS NULL
-                ORDER BY updated_at DESC
+                ORDER BY favorite DESC, updated_at DESC
             """).fetchall()
 
-        return [Work(**dict(row)) for row in rows]
+        result = []
+        for row in rows:
+            data = dict(row)
+            data["favorite"] = bool(data["favorite"])
+            result.append(Work(**data))
+        return result
 
     def create(
         self,
@@ -72,13 +112,16 @@ class SQLiteWorkRepository:
         status="Quero ler",
         release_day=None,
         synopsis="",
-        work_id=None,
-        created_at=None,
-        updated_at=None,
+        rating=None,
+        favorite=False,
+        personal_notes="",
     ):
+        if rating is not None and rating not in (1, 2, 3, 4, 5):
+            raise ValueError("A avaliação deve estar entre 1 e 5.")
+
         now = datetime.now(timezone.utc).isoformat()
         work = Work(
-            id=work_id or str(uuid.uuid4()),
+            id=str(uuid.uuid4()),
             name=name,
             category=category,
             progress_unit=progress_unit,
@@ -87,8 +130,11 @@ class SQLiteWorkRepository:
             status=status,
             release_day=release_day,
             synopsis=synopsis,
-            created_at=created_at or now,
-            updated_at=updated_at or now,
+            rating=rating,
+            favorite=favorite,
+            personal_notes=personal_notes,
+            created_at=now,
+            updated_at=now,
         )
 
         with self._connect() as conn:
@@ -96,10 +142,14 @@ class SQLiteWorkRepository:
                 INSERT INTO works (
                     id, name, category, progress_unit,
                     progress_current, progress_total, status,
-                    release_day, synopsis, created_at,
-                    updated_at, sync_status
+                    release_day, synopsis, rating, favorite,
+                    personal_notes, created_at, updated_at,
+                    sync_status
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_CREATE')
+                VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    'PENDING_CREATE'
+                )
             """, (
                 work.id,
                 work.name,
@@ -110,6 +160,9 @@ class SQLiteWorkRepository:
                 work.status,
                 work.release_day,
                 work.synopsis,
+                work.rating,
+                int(work.favorite),
+                work.personal_notes,
                 work.created_at,
                 work.updated_at,
             ))
@@ -143,7 +196,12 @@ class SQLiteWorkRepository:
                     updated_at = ?,
                     sync_status = ?
                 WHERE id = ?
-            """, (new_value, now, next_sync, work_id))
+            """, (
+                new_value,
+                now,
+                next_sync,
+                work_id,
+            ))
 
             conn.execute("""
                 INSERT INTO history (
@@ -158,27 +216,132 @@ class SQLiteWorkRepository:
                 now,
             ))
 
+    def set_favorite(self, work_id, favorite):
+        self._update_metadata(
+            work_id,
+            favorite=int(bool(favorite)),
+        )
+
+    def set_rating(self, work_id, rating):
+        if rating not in (1, 2, 3, 4, 5):
+            raise ValueError("A avaliação deve estar entre 1 e 5.")
+        self._update_metadata(work_id, rating=rating)
+
+    def set_notes(self, work_id, notes):
+        self._update_metadata(
+            work_id,
+            personal_notes=notes,
+        )
+
+    def _update_metadata(self, work_id, **fields):
+        allowed = {
+            "favorite",
+            "rating",
+            "personal_notes",
+        }
+        invalid = set(fields) - allowed
+        if invalid:
+            raise ValueError(
+                f"Campos inválidos: {sorted(invalid)}"
+            )
+
+        now = datetime.now(timezone.utc).isoformat()
+        assignments = [
+            f"{name} = ?"
+            for name in fields
+        ]
+        values = list(fields.values())
+
+        assignments.extend([
+            "updated_at = ?",
+            "sync_status = 'PENDING_UPDATE'",
+        ])
+        values.extend([now, work_id])
+
+        with self._connect() as conn:
+            conn.execute(
+                f"""
+                UPDATE works
+                SET {", ".join(assignments)}
+                WHERE id = ?
+                """,
+                values,
+            )
+
+    def get_tags(self, work_id):
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT tag
+                FROM work_tags
+                WHERE work_id = ?
+                ORDER BY tag
+            """, (work_id,)).fetchall()
+
+        return [row["tag"] for row in rows]
+
+    def set_tags(self, work_id, tags):
+        clean_tags = sorted({
+            tag.strip()
+            for tag in tags
+            if tag.strip()
+        })
+
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM work_tags WHERE work_id = ?",
+                (work_id,),
+            )
+            for tag in clean_tags:
+                conn.execute("""
+                    INSERT INTO work_tags (work_id, tag)
+                    VALUES (?, ?)
+                """, (work_id, tag))
+
+            conn.execute("""
+                UPDATE works
+                SET updated_at = ?,
+                    sync_status = 'PENDING_UPDATE'
+                WHERE id = ?
+            """, (
+                datetime.now(timezone.utc).isoformat(),
+                work_id,
+            ))
+
     def export_payload(self):
         with self._connect() as conn:
             works = [
                 dict(row)
-                for row in conn.execute("SELECT * FROM works").fetchall()
+                for row in conn.execute(
+                    "SELECT * FROM works"
+                ).fetchall()
             ]
             history = [
                 dict(row)
-                for row in conn.execute("SELECT * FROM history").fetchall()
+                for row in conn.execute(
+                    "SELECT * FROM history"
+                ).fetchall()
             ]
+            tags = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM work_tags"
+                ).fetchall()
+            ]
+
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "works": works,
             "history": history,
+            "tags": tags,
         }
 
     def replace_from_payload(self, payload):
         works = payload.get("works", [])
         history = payload.get("history", [])
+        tags = payload.get("tags", [])
 
         with self._connect() as conn:
+            conn.execute("DELETE FROM work_tags")
             conn.execute("DELETE FROM history")
             conn.execute("DELETE FROM works")
 
@@ -187,10 +350,14 @@ class SQLiteWorkRepository:
                     INSERT INTO works (
                         id, name, category, progress_unit,
                         progress_current, progress_total, status,
-                        release_day, synopsis, created_at, updated_at,
+                        release_day, synopsis, rating, favorite,
+                        personal_notes, created_at, updated_at,
                         deleted_at, sync_status
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?
+                    )
                 """, (
                     item["id"],
                     item["name"],
@@ -201,6 +368,9 @@ class SQLiteWorkRepository:
                     item.get("status", "Quero ler"),
                     item.get("release_day"),
                     item.get("synopsis", ""),
+                    item.get("rating"),
+                    item.get("favorite", 0),
+                    item.get("personal_notes", ""),
                     item["created_at"],
                     item["updated_at"],
                     item.get("deleted_at"),
@@ -220,4 +390,13 @@ class SQLiteWorkRepository:
                     item["description"],
                     item["created_at"],
                     item.get("sync_status", "SYNCED"),
+                ))
+
+            for item in tags:
+                conn.execute("""
+                    INSERT INTO work_tags (work_id, tag)
+                    VALUES (?, ?)
+                """, (
+                    item["work_id"],
+                    item["tag"],
                 ))
