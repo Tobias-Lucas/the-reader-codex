@@ -31,7 +31,7 @@ class BackupService:
         with open(file_path, "r", encoding="utf-8") as f:
             payload = json.load(f)
 
-        if payload.get("schema_version") != 1:
+        if payload.get("schema_version") not in (1, 2):
             raise ValueError("Versão de backup não suportada.")
 
         self.repository.replace_from_payload(payload)

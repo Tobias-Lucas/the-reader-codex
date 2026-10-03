@@ -1,4 +1,3 @@
-import os
 import threading
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
@@ -7,6 +6,7 @@ from app.components.work_card import WorkCard
 from app.repositories.sqlite_repository import SQLiteWorkRepository
 from app.services.backup_service import BackupService
 from app.services.sync_engine import SyncEngine
+from app.ui.work_details_dialog import WorkDetailsDialog
 
 
 class MainWindow(ctk.CTk):
@@ -32,16 +32,23 @@ class MainWindow(ctk.CTk):
         if self.repo.list_all():
             return
 
-        self.repo.create(
+        duna = self.repo.create(
             name="Duna",
             category="Livro",
             progress_unit="Página",
             progress_current=241,
             progress_total=412,
             status="Lendo",
+            rating=5,
+            favorite=True,
+            personal_notes="Excelente construção de mundo.",
+        )
+        self.repo.set_tags(
+            duna.id,
+            ["ficção científica", "clássico"],
         )
 
-        self.repo.create(
+        frieren = self.repo.create(
             name="Frieren",
             category="Mangá",
             progress_unit="Capítulo",
@@ -49,6 +56,11 @@ class MainWindow(ctk.CTk):
             progress_total=140,
             status="Lendo",
             release_day="Terça-feira",
+            rating=4,
+        )
+        self.repo.set_tags(
+            frieren.id,
+            ["fantasia", "mangá"],
         )
 
     def _build_shell(self):
@@ -72,6 +84,7 @@ class MainWindow(ctk.CTk):
         for text, command in [
             ("🏠  Início", self.show_home),
             ("📚  Biblioteca", self.show_library),
+            ("⭐  Favoritos", self.show_favorites),
             ("🕘  Histórico", self.show_history),
             ("💾  Backup", self.show_backup),
         ]:
@@ -89,7 +102,10 @@ class MainWindow(ctk.CTk):
             text_color=("gray35", "gray70"),
             wraplength=180,
         )
-        self.sync_label.pack(side="bottom", pady=(0, 18))
+        self.sync_label.pack(
+            side="bottom",
+            pady=(0, 18),
+        )
 
         self.content = ctk.CTkScrollableFrame(
             self,
@@ -120,7 +136,10 @@ class MainWindow(ctk.CTk):
             text=subtitle,
             text_color=("gray35", "gray70"),
             anchor="w",
-        ).pack(fill="x", pady=(4, 18))
+        ).pack(
+            fill="x",
+            pady=(4, 18),
+        )
 
     def _render_work(self, work):
         total = work.progress_total or 0
@@ -138,7 +157,19 @@ class MainWindow(ctk.CTk):
             else f"{work.progress_unit}: {work.progress_current}"
         )
 
-        WorkCard(
+        tags = self.repo.get_tags(work.id)
+        rating = f"{'★' * (work.rating or 0)}"
+        favorite = "⭐ " if work.favorite else ""
+        extra = " • ".join(
+            part
+            for part in [
+                favorite + rating if rating else favorite.strip(),
+                ", ".join(tags[:3]),
+            ]
+            if part
+        )
+
+        frame = WorkCard(
             self.content,
             title=work.name,
             category=work.category,
@@ -146,17 +177,39 @@ class MainWindow(ctk.CTk):
             status=work.status,
             percent=percent,
             on_increment=lambda wid=work.id: self._increment(wid),
-        ).pack(fill="x", pady=7)
+            extra_text=extra,
+        )
+        frame.pack(fill="x", pady=7)
+
+        ctk.CTkButton(
+            frame,
+            text="Detalhes",
+            width=86,
+            command=lambda w=work: self.open_details(w),
+        ).grid(
+            row=3,
+            column=2,
+            padx=14,
+            pady=(0, 8),
+        )
 
     def _increment(self, work_id):
         self.repo.increment_progress(work_id)
         self.show_library()
 
+    def open_details(self, work):
+        WorkDetailsDialog(
+            self,
+            self.repo,
+            work,
+            on_saved=self.show_library,
+        )
+
     def show_home(self):
         self._clear_content()
         self._header(
             "Início",
-            "Local-first com backup e portabilidade dos dados.",
+            "Sua leitura, organizada do seu jeito.",
         )
 
         works = self.repo.list_all()
@@ -167,10 +220,33 @@ class MainWindow(ctk.CTk):
         self._clear_content()
         self._header(
             "Biblioteca",
-            "Dados armazenados localmente em SQLite.",
+            "Tags, avaliações, favoritos e notas pessoais.",
         )
 
         for work in self.repo.list_all():
+            self._render_work(work)
+
+    def show_favorites(self):
+        self._clear_content()
+        self._header(
+            "Favoritos",
+            "Obras marcadas como favoritas.",
+        )
+
+        favorites = [
+            work
+            for work in self.repo.list_all()
+            if work.favorite
+        ]
+
+        if not favorites:
+            ctk.CTkLabel(
+                self.content,
+                text="Nenhuma obra favorita ainda.",
+            ).pack(anchor="w")
+            return
+
+        for work in favorites:
             self._render_work(work)
 
     def show_history(self):
@@ -203,7 +279,7 @@ class MainWindow(ctk.CTk):
         self._clear_content()
         self._header(
             "Backup e dados",
-            "Exporte, importe ou crie uma cópia de segurança.",
+            "Importação, exportação e cópias de segurança.",
         )
 
         ctk.CTkButton(
@@ -223,15 +299,6 @@ class MainWindow(ctk.CTk):
             text="Criar backup agora",
             command=self.manual_backup,
         ).pack(anchor="w", pady=6)
-
-        ctk.CTkLabel(
-            self.content,
-            text=(
-                "O sistema também cria backup automático "
-                "ao iniciar a aplicação."
-            ),
-            text_color=("gray35", "gray70"),
-        ).pack(anchor="w", pady=(12, 0))
 
     def export_json(self):
         path = filedialog.asksaveasfilename(
@@ -304,4 +371,6 @@ class MainWindow(ctk.CTk):
             )
             return
 
-        self.sync_label.configure(text="☁ Sincronizado")
+        self.sync_label.configure(
+            text="☁ Sincronizado"
+        )

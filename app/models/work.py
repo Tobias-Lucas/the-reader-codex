@@ -13,5 +13,8 @@ class Work:
     status: str
     release_day: Optional[str]
     synopsis: str
+    rating: Optional[int]
+    favorite: bool
+    personal_notes: str
     created_at: str
     updated_at: str
