@@ -1,22 +1,17 @@
-import json
-import os
 import socket
 from datetime import datetime, timezone
 
 
 class SyncEngine:
-    def __init__(
-        self,
-        repository,
-        remote_path="data/remote_simulated.json",
-    ):
+    def __init__(self, repository):
         self.repository = repository
-        self.remote_path = remote_path
-        os.makedirs(os.path.dirname(remote_path), exist_ok=True)
 
     def has_network(self):
         try:
-            socket.create_connection(("8.8.8.8", 53), timeout=1).close()
+            socket.create_connection(
+                ("8.8.8.8", 53),
+                timeout=1,
+            ).close()
             return True
         except OSError:
             return False

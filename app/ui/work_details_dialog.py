@@ -11,7 +11,7 @@ class WorkDetailsDialog(ctk.CTkToplevel):
         self.on_saved = on_saved
 
         self.title(f"Detalhes — {work.name}")
-        self.geometry("560x560")
+        self.geometry("580x680")
         self.transient(master)
         self.grab_set()
 
@@ -48,13 +48,12 @@ class WorkDetailsDialog(ctk.CTkToplevel):
         ctk.CTkLabel(
             self,
             text="Avaliação",
-            anchor="w",
         ).grid(
             row=2,
             column=0,
             sticky="w",
             padx=24,
-            pady=(14, 4),
+            pady=(12, 4),
         )
 
         self.rating_var = ctk.StringVar(
@@ -74,45 +73,78 @@ class WorkDetailsDialog(ctk.CTkToplevel):
 
         ctk.CTkLabel(
             self,
-            text="Tags",
-            anchor="w",
+            text="Data de início (AAAA-MM-DD)",
         ).grid(
             row=4,
             column=0,
             sticky="w",
             padx=24,
-            pady=(18, 4),
+            pady=(16, 4),
         )
 
-        self.tags_entry = ctk.CTkEntry(
-            self,
-            placeholder_text=(
-                "fantasia, ficção científica, favorito..."
-            ),
-        )
-        self.tags_entry.grid(
+        self.start_entry = ctk.CTkEntry(self)
+        self.start_entry.grid(
             row=5,
+            column=0,
+            sticky="ew",
+            padx=24,
+        )
+        if work.start_date:
+            self.start_entry.insert(0, work.start_date)
+
+        ctk.CTkLabel(
+            self,
+            text="Data de conclusão (AAAA-MM-DD)",
+        ).grid(
+            row=6,
+            column=0,
+            sticky="w",
+            padx=24,
+            pady=(16, 4),
+        )
+
+        self.end_entry = ctk.CTkEntry(self)
+        self.end_entry.grid(
+            row=7,
+            column=0,
+            sticky="ew",
+            padx=24,
+        )
+        if work.end_date:
+            self.end_entry.insert(0, work.end_date)
+
+        ctk.CTkLabel(
+            self,
+            text="Tags",
+        ).grid(
+            row=8,
+            column=0,
+            sticky="w",
+            padx=24,
+            pady=(16, 4),
+        )
+
+        self.tags_entry = ctk.CTkEntry(self)
+        self.tags_entry.grid(
+            row=9,
             column=0,
             sticky="ew",
             padx=24,
         )
         self.tags_entry.insert(
             0,
-            ", ".join(
-                repository.get_tags(work.id)
-            ),
+            ", ".join(repository.get_tags(work.id)),
         )
 
         ctk.CTkLabel(
             self,
             text="Notas pessoais",
-            anchor="w",
         ).grid(
-            row=6,
+            row=10,
             column=0,
             sticky="w",
             padx=24,
-            pady=(18, 4),
+            pady=(16, 4),
         )
 
         self.notes = ctk.CTkTextbox(
@@ -120,7 +152,7 @@ class WorkDetailsDialog(ctk.CTkToplevel):
             height=180,
         )
         self.notes.grid(
-            row=7,
+            row=11,
             column=0,
             sticky="nsew",
             padx=24,
@@ -135,7 +167,7 @@ class WorkDetailsDialog(ctk.CTkToplevel):
             text="Salvar alterações",
             command=self.save,
         ).grid(
-            row=8,
+            row=12,
             column=0,
             sticky="e",
             padx=24,
@@ -155,22 +187,24 @@ class WorkDetailsDialog(ctk.CTkToplevel):
             self.work.id,
             self.notes.get("1.0", "end").strip(),
         )
-
-        tags = [
-            item.strip()
-            for item in self.tags_entry.get().split(",")
-            if item.strip()
-        ]
         self.repository.set_tags(
             self.work.id,
-            tags,
+            [
+                item.strip()
+                for item in self.tags_entry.get().split(",")
+                if item.strip()
+            ],
+        )
+        self.repository.set_reading_dates(
+            self.work.id,
+            self.start_entry.get().strip() or None,
+            self.end_entry.get().strip() or None,
         )
 
         messagebox.showinfo(
             "Salvo",
-            "Metadados atualizados.",
+            "Dados da obra atualizados.",
             parent=self,
         )
-
         self.on_saved()
         self.destroy()

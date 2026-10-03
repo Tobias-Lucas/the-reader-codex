@@ -31,11 +31,10 @@ class BackupService:
         with open(file_path, "r", encoding="utf-8") as f:
             payload = json.load(f)
 
-        if payload.get("schema_version") not in (1, 2):
+        if payload.get("schema_version") not in (1, 2, 3):
             raise ValueError("Versão de backup não suportada.")
 
         self.repository.replace_from_payload(payload)
-        return True
 
     def create_automatic_backup(self):
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
