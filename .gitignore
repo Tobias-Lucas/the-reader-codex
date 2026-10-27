@@ -1,8 +1,29 @@
 __pycache__/
 *.pyc
+.pytest_cache/
+.coverage
+htmlcov/
 .venv/
+
+# Credenciais/configuração local
 credentials.json
 config.json
+data/settings.json
+
+# Dados do usuário
 data/*.db
-data/remote_simulated.json
+data/*.db-wal
+data/*.db-shm
 data/backups/
+data/covers/
+data/remote_simulated.json
+
+# OAuth Google tokens
+data/google_token_*.json
+
+# Artefatos de build/instalador
+.venv-build/
+dist/
+build/TheReaderCodex/
+installer-output/
+*.log

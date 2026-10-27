@@ -13,10 +13,11 @@ class Work:
     status: str
     release_day: Optional[str]
     synopsis: str
-    rating: Optional[int]
+    rating: Optional[float]
     favorite: bool
     personal_notes: str
     start_date: Optional[str]
     end_date: Optional[str]
+    cover_path: Optional[str]
     created_at: str
     updated_at: str
