@@ -16,58 +16,42 @@ O sistema utiliza **SQLite como fonte principal dos dados**, permitindo funciona
 
 ## ✨ Funcionalidades
 
-- 📚 Cadastro e organização de livros, mangás, manhwas, HQs e outras obras
-- 🖼️ Capas personalizadas para cada obra
+- 📚 Cadastro, edição e organização de livros, mangás, manhwas, HQs e outras obras
+- 🖼️ Capas personalizadas, com troca e remoção
 - 📖 Controle de progresso por **páginas ou capítulos**
-- ⚡ Atualização rápida de progresso
+- ⚡ Atualização rápida de progresso nos cards e detalhes
 - ⭐ Favoritos separados da avaliação
 - 🌟 Avaliação de **0,5 a 5 estrelas**
 - 🏷️ Categorias e tags personalizadas
 - 📝 Sinopse e notas pessoais
-- 🔗 Link direto para leitura
-- 🔍 Busca e filtros por título, categoria, tags e status
+- 🔗 Link direto para leitura no navegador padrão
+- 🔍 Busca e filtros por título, categoria, tags, status de leitura e status da obra
 - 🕘 Histórico de leitura
 - 🎯 Metas de leitura
 - 📊 Estatísticas da biblioteca
 - 📅 Calendário e acompanhamento de lançamentos
+- 💤 Pausa automática por inatividade configurável
 - 📴 Funcionamento totalmente offline
-- ☁️ Sincronização opcional com Google
-- 💾 Backup completo da biblioteca
-- 🔄 Migração automática de bancos de versões anteriores
+- ☁️ Sincronização bidirecional opcional com Google
+- 💾 Backup JSON, ZIP completo com capas e backups automáticos locais
+- 🔄 Migração automática de bancos SQLite de versões anteriores
 
 ---
 
-## 📖 Acompanhamento de leitura
+## 🎨 Interface
 
-O The Reader Codex separa o **status da obra** do seu **status pessoal de leitura**.
-
-### Status da obra
-
-- Em lançamento
-- Completo
-- Em hiato
-- Cancelado
-
-### Status de leitura
-
-- Quero ler
-- Lendo
-- Pausado
-- Concluído
-- Abandonado
-
-Para obras seriadas, o sistema destaca o **último capítulo lido**, acompanha capítulos pendentes e pode calcular previsões de novos lançamentos.
+A interface desktop é construída com **PySide6 / Qt 6** e utiliza o tema visual **Nocturne Folio**.
 
 ---
 
 ## 🛠️ Tecnologias
 
-- **Python 3.10+**
+- **Python 3.10+ 64-bit**
 - **PySide6 / Qt 6**
 - **SQLite**
 - **Pillow**
 - **PyInstaller**
-- **Inno Setup**
+- **Inno Setup 6/7**
 - **Google Sheets API**
 - **Google Drive API**
 - **Google OAuth 2.0**
@@ -96,7 +80,7 @@ Para obras seriadas, o sistema destaca o **último capítulo lido**, acompanha c
 
 A aplicação trabalha sempre primeiro com o banco local.
 
-Isso significa que toda a biblioteca continua disponível mesmo sem internet. Quando a sincronização está habilitada, as alterações locais podem ser enviadas posteriormente para a nuvem.
+Isso permite que toda a biblioteca continue disponível sem internet. Quando a sincronização está habilitada, as alterações locais podem ser enviadas posteriormente para a nuvem.
 
 ---
 
@@ -135,40 +119,30 @@ the-reader-codex/
 
 ## 🚀 Executando em desenvolvimento
 
-Clone o projeto:
+Requer **Python 3.10+ 64-bit**.
 
-```bash
-git clone https://github.com/SEU-USUARIO/the-reader-codex.git
-cd the-reader-codex
-```
+Crie o ambiente virtual:
 
-Crie um ambiente virtual:
-
-```bash
+```powershell
 python -m venv .venv
 ```
 
-### Windows
+No Windows:
 
 ```powershell
-.venv\Scripts\activate
-```
-
-### Linux / macOS
-
-```bash
-source .venv/bin/activate
+.\.venv\Scripts\Activate.ps1
 ```
 
 Instale as dependências:
 
-```bash
+```powershell
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
 Execute:
 
-```bash
+```powershell
 python main.py
 ```
 
@@ -182,6 +156,11 @@ O projeto utiliza:
 
 **PyInstaller → Inno Setup → instalador `.exe`**
 
+Instale previamente:
+
+- Python 3.10+ 64-bit
+- Inno Setup 6 ou 7
+
 No PowerShell, dentro da pasta do projeto:
 
 ```powershell
@@ -191,12 +170,14 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 O script:
 
-1. cria o ambiente de build
-2. instala as dependências
-3. executa os testes automatizados
-4. gera o aplicativo com PyInstaller
-5. localiza o Inno Setup
-6. gera o instalador final
+1. lê automaticamente a versão de `app/version.py`
+2. cria ou reutiliza `.venv-build`
+3. instala e atualiza as dependências
+4. executa os testes automatizados
+5. gera o aplicativo com PyInstaller
+6. localiza o Inno Setup
+7. passa a versão atual para o Inno Setup
+8. gera o instalador final
 
 O resultado fica em:
 
@@ -205,34 +186,11 @@ installer-output/
 └── TheReaderCodex-Setup-X.X.X.exe
 ```
 
-O instalador cria:
-
-- entrada no Menu Iniciar
-- desinstalador
-- opção de atalho na Área de Trabalho
-- instalação separada dos dados pessoais
-
 ---
 
 ## 📂 Dados do usuário
 
-Em desenvolvimento:
-
-```text
-data/
-├── reader.db
-├── covers/
-├── backups/
-└── settings.json
-```
-
-No aplicativo instalado no Windows:
-
-```text
-%LOCALAPPDATA%\TheReaderCodex\
-```
-
-Banco, capas, backups, configurações e tokens ficam separados dos arquivos do aplicativo.
+Banco, capas, backups, logs, configurações, credenciais locais e tokens ficam separados dos arquivos do aplicativo.
 
 Dessa forma, atualizar ou reinstalar o programa não apaga a biblioteca.
 
@@ -267,23 +225,7 @@ Configurações
 
 Na primeira autorização, o navegador será aberto para login na conta Google.
 
----
-
-## 📊 Google Sheets
-
-Quando configurado, o sistema utiliza as abas:
-
-```text
-Works
-Categories
-Goals
-History
-Meta
-```
-
-Se nenhuma planilha tiver sido informada, o aplicativo pode localizar ou criar automaticamente a estrutura necessária.
-
-Os metadados ficam no **Google Sheets** e as capas ficam no **Google Drive**.
+Também é possível utilizar **service account**, desde que a planilha e a pasta do Drive tenham as permissões necessárias.
 
 ---
 
@@ -311,6 +253,7 @@ A sincronização suporta:
 - sincronização manual
 - resolução de conflitos por `updated_at`
 - propagação de exclusões
+- sincronização dos campos de publicação, agenda e link de leitura
 - atualização remota de capas
 - funcionamento offline
 
@@ -321,28 +264,15 @@ A sincronização suporta:
 O sistema possui três formas principais de proteção dos dados.
 
 ### JSON
-
 Exporta os metadados estruturados.
 
-```text
-library.json
-```
-
 ### ZIP completo
-
-Exporta:
-
-```text
-metadados
-+
-capas
-```
-
+Exporta os metadados e as capas da biblioteca.
 É o formato recomendado para transferência entre computadores.
 
 ### Backup automático
-
-O sistema também pode gerar backups locais automaticamente e manter as versões mais recentes.
+O sistema também gera backups locais com rotação das versões mais recentes.
+Antes de uma restauração feita pela interface, a biblioteca atual é protegida com um backup preventivo.
 
 ---
 
@@ -350,26 +280,26 @@ O sistema também pode gerar backups locais automaticamente e manter as versões
 
 Execute:
 
-```bash
-python -m unittest discover -s tests -v
+```powershell
+python -W error::ResourceWarning -m unittest discover -s tests -v
 ```
 
-A suíte automatizada cobre, entre outros:
+A suíte atual possui **43 testes automatizados** e cobre, entre outros:
 
 - primeira execução vazia
 - CRUD de obras
-- categorias
-- tags
-- filtros
+- categorias e tipo de progresso
+- tags e filtros
 - avaliações em meia estrela
 - progresso por páginas e capítulos
-- status de leitura
-- status de publicação
-- datas
-- agendas de lançamento
+- status de leitura e status de publicação
+- datas brasileiras
+- agendas semanal, quinzenal e mensal
+- lançamentos de ontem, hoje e amanhã
 - capítulos pendentes
-- metas
-- histórico
+- hiato preservando agenda
+- pausa automática por inatividade
+- metas e histórico
 - migração de banco
 - backup e restauração
 - Google Sync

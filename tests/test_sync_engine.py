@@ -71,7 +71,12 @@ class SyncEngineTests(unittest.TestCase):
     def test_local_changes_are_uploaded_and_marked_synced(self):
         with tempfile.TemporaryDirectory() as td:
             repo = SQLiteWorkRepository(Path(td) / "db.sqlite", Path(td) / "covers")
-            work = repo.create(name="Local", category="Livro", rating=4.5)
+            work = repo.create(
+                name="Local", category="Manhwa", rating=4.5,
+                progress_unit="Capítulo", progress_current=12,
+                publication_status="Em lançamento", release_schedule_type="Semanal",
+                release_days=["Segunda-feira"], reading_url="https://example.com/ler",
+            )
             repo.set_tags(work.id, ["tag"])
             settings = FakeSettings(enabled=True)
             adapter = FakeAdapter()
@@ -81,6 +86,9 @@ class SyncEngineTests(unittest.TestCase):
             self.assertEqual(repo.pending_sync_count(), 0)
             self.assertEqual(adapter.uploaded["works"][0]["name"], "Local")
             self.assertEqual(adapter.uploaded["works"][0]["tags"], ["tag"])
+            self.assertEqual(adapter.uploaded["works"][0]["publication_status"], "Em lançamento")
+            self.assertEqual(adapter.uploaded["works"][0]["release_schedule_type"], "Semanal")
+            self.assertEqual(adapter.uploaded["works"][0]["reading_url"], "https://example.com/ler")
             self.assertEqual(settings.data["google"]["spreadsheet_id"], "sheet-123")
 
     def test_changed_remote_cover_version_is_downloaded(self):
@@ -115,13 +123,18 @@ class SyncEngineTests(unittest.TestCase):
             repo.mark_all_synced()
             remote = repo.export_sync_payload()
             remote["works"][0]["name"] = "Remote"
+            remote["works"][0]["publication_status"] = "Em hiato"
+            remote["works"][0]["reading_url"] = "https://example.com/remoto"
             remote["works"][0]["updated_at"] = "9999-01-01T00:00:00+00:00"
             adapter = FakeAdapter(remote)
             settings = FakeSettings(enabled=True)
             engine = SyncEngine(repo, settings, adapter_factory=lambda _cfg: adapter)
             result = engine.sync()
             self.assertEqual(result["status"], "synced")
-            self.assertEqual(repo.get_by_id(work.id).name, "Remote")
+            refreshed = repo.get_by_id(work.id)
+            self.assertEqual(refreshed.name, "Remote")
+            self.assertEqual(refreshed.publication_status, "Em hiato")
+            self.assertEqual(refreshed.reading_url, "https://example.com/remoto")
             self.assertEqual(adapter.uploaded["works"][0]["name"], "Remote")
 
 

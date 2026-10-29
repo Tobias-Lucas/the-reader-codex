@@ -23,12 +23,14 @@ class GoogleSyncAdapter:
 
     WORKS_HEADERS = [
         "id", "name", "category", "progress_unit", "progress_current",
-        "progress_total", "status", "release_day", "synopsis", "rating",
+        "progress_total", "status", "publication_status", "release_day",
+        "release_schedule_type", "release_days", "release_month_day", "release_anchor_date",
+        "last_release_read_date", "reading_url", "synopsis", "rating",
         "favorite", "personal_notes", "start_date", "end_date",
         "cover_remote_id", "cover_filename", "cover_remote_modified", "created_at", "updated_at",
         "deleted_at", "tags_json",
     ]
-    CATEGORIES_HEADERS = ["id", "name", "created_at", "updated_at", "deleted_at"]
+    CATEGORIES_HEADERS = ["id", "name", "progress_unit", "created_at", "updated_at", "deleted_at"]
     GOALS_HEADERS = [
         "id", "title", "goal_type", "target_value", "current_value",
         "start_date", "end_date", "created_at", "updated_at", "deleted_at",
@@ -235,14 +237,26 @@ class GoogleSyncAdapter:
     def _ensure_worksheets(self):
         info = self._sheets.spreadsheets().get(
             spreadsheetId=self.spreadsheet_id,
-            fields="sheets.properties.title",
+            fields="sheets.properties(title,sheetId,gridProperties(columnCount,rowCount))",
         ).execute()
-        existing = {sheet["properties"]["title"] for sheet in info.get("sheets", [])}
+        sheets = {sheet["properties"]["title"]: sheet["properties"] for sheet in info.get("sheets", [])}
         required = ["Works", "Categories", "Goals", "History", "Meta"]
         requests = []
         for title in required:
-            if title not in existing:
-                requests.append({"addSheet": {"properties": {"title": title, "gridProperties": {"rowCount": 1000, "columnCount": 26}}}})
+            if title not in sheets:
+                requests.append({"addSheet": {"properties": {"title": title, "gridProperties": {"rowCount": 1000, "columnCount": 52}}}})
+                continue
+            props = sheets[title]
+            if int(props.get("gridProperties", {}).get("columnCount", 0) or 0) < 52:
+                requests.append({
+                    "updateSheetProperties": {
+                        "properties": {
+                            "sheetId": props["sheetId"],
+                            "gridProperties": {"columnCount": 52},
+                        },
+                        "fields": "gridProperties.columnCount",
+                    }
+                })
         if requests:
             self._sheets.spreadsheets().batchUpdate(
                 spreadsheetId=self.spreadsheet_id,
@@ -293,7 +307,7 @@ class GoogleSyncAdapter:
     def _get_rows(self, title, headers):
         response = self._sheets.spreadsheets().values().get(
             spreadsheetId=self.spreadsheet_id,
-            range=f"'{title}'!A:Z",
+            range=f"'{title}'!A:AZ",
         ).execute()
         values = response.get("values", [])
         if not values:
@@ -314,7 +328,7 @@ class GoogleSyncAdapter:
     def _replace_rows(self, title, headers, rows):
         self._sheets.spreadsheets().values().clear(
             spreadsheetId=self.spreadsheet_id,
-            range=f"'{title}'!A:Z",
+            range=f"'{title}'!A:AZ",
             body={},
         ).execute()
         values = [headers] + [[self._as_text(row.get(header)) for header in headers] for row in rows]
@@ -346,7 +360,14 @@ class GoogleSyncAdapter:
                 "progress_current": self._as_int(row.get("progress_current"), 0),
                 "progress_total": self._as_optional_int(row.get("progress_total")),
                 "status": row.get("status") or "Quero ler",
+                "publication_status": row.get("publication_status") or "Completo",
                 "release_day": row.get("release_day") or None,
+                "release_schedule_type": row.get("release_schedule_type") or "Sem calendário",
+                "release_days": row.get("release_days") or None,
+                "release_month_day": self._as_optional_int(row.get("release_month_day")),
+                "release_anchor_date": row.get("release_anchor_date") or None,
+                "last_release_read_date": row.get("last_release_read_date") or None,
+                "reading_url": row.get("reading_url") or None,
                 "synopsis": row.get("synopsis", ""),
                 "rating": self._as_optional_float(row.get("rating")),
                 "favorite": self._as_bool(row.get("favorite")),
@@ -367,6 +388,7 @@ class GoogleSyncAdapter:
             if row.get("id") and row.get("name"):
                 categories.append({
                     "id": row["id"], "name": row["name"],
+                    "progress_unit": row.get("progress_unit") or "Página",
                     "created_at": row.get("created_at") or "",
                     "updated_at": row.get("updated_at") or "",
                     "deleted_at": row.get("deleted_at") or None,
@@ -399,7 +421,7 @@ class GoogleSyncAdapter:
                     "created_at": row.get("created_at") or "",
                 })
         return {
-            "schema_version": 5,
+            "schema_version": 7,
             "works": works,
             "categories": categories,
             "goals": goals,
@@ -419,7 +441,7 @@ class GoogleSyncAdapter:
         self._replace_rows("Goals", self.GOALS_HEADERS, payload.get("goals", []))
         self._replace_rows("History", self.HISTORY_HEADERS, payload.get("history", []))
         self._replace_rows("Meta", self.META_HEADERS, [
-            {"key": "schema_version", "value": payload.get("schema_version", 5)},
+            {"key": "schema_version", "value": payload.get("schema_version", 7)},
             {"key": "application", "value": "The Reader Codex"},
         ])
 

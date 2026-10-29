@@ -11,7 +11,14 @@ class Work:
     progress_current: int
     progress_total: Optional[int]
     status: str
+    publication_status: str
     release_day: Optional[str]
+    release_schedule_type: str
+    release_days: Optional[str]
+    release_month_day: Optional[int]
+    release_anchor_date: Optional[str]
+    last_release_read_date: Optional[str]
+    reading_url: Optional[str]
     synopsis: str
     rating: Optional[float]
     favorite: bool
