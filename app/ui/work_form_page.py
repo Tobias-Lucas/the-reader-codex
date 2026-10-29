@@ -1,364 +1,417 @@
-from pathlib import Path
-from tkinter import filedialog, messagebox
+from __future__ import annotations
 
-import customtkinter as ctk
-from PIL import Image
+from pathlib import Path
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QPixmap
+from PySide6.QtWidgets import (
+    QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout,
+    QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea, QTextEdit, QVBoxLayout, QWidget
+)
 
 from app.ui.date_field import DateField
-from app.ui.theme import (
-    AMBER, AMBER_BRIGHT, BLACK_TEXT, BORDER, RED, SURFACE, SURFACE_LOW,
-    SURFACE_RAISED, TEXT, TEXT_DIM, TEXT_MUTED, sans,
-)
-from app.utils.dates import WEEKDAYS_PT, normalize_weekday
+from app.ui.icons import icon
+from app.ui.widgets import NumericStepper, PageHeader, RatingSlider
+from app.utils.dates import WEEKDAYS_PT
 
 
-class WorkFormPage(ctk.CTkFrame):
-    RATING_OPTIONS = [
-        "Sem avaliação", "0,5", "1,0", "1,5", "2,0", "2,5",
-        "3,0", "3,5", "4,0", "4,5", "5,0",
-    ]
+class WorkFormPage(QWidget):
+    saved = Signal(str)
+    cancelled = Signal()
+    deleted = Signal()
 
-    def __init__(self, master, repository, on_saved, on_cancel, on_deleted=None, work=None):
-        super().__init__(master, fg_color="transparent")
+    def __init__(self, repository, work=None, parent=None):
+        super().__init__(parent)
         self.repository = repository
         self.work = work
-        self.on_saved = on_saved
-        self.on_cancel = on_cancel
-        self.on_deleted = on_deleted or on_cancel
-        self._selected_cover_source = None
+        self._cover_source = None
         self._remove_cover = False
-        self._cover_image = None
-        self.grid_columnconfigure(0, weight=1)
-        self._build(work is not None)
-        self._fill_existing_values()
-        self._refresh_progress_preview()
-        self._refresh_rating_preview(self.rating_menu.get())
-
-    def _build(self, editing):
-        nav = ctk.CTkFrame(self, fg_color="transparent")
-        nav.grid(row=0, column=0, sticky="ew", padx=6, pady=(4, 10))
-        ctk.CTkButton(
-            nav, text="← Voltar", width=90, height=34, command=self.on_cancel,
-            fg_color="transparent", hover_color=SURFACE_RAISED, border_width=1,
-            border_color=BORDER, text_color=TEXT_MUTED, font=sans(12, "bold"),
-        ).pack(side="left")
-        ctk.CTkLabel(
-            nav, text="EDITAR OBRA" if editing else "NOVA OBRA",
-            font=sans(11, "bold"), text_color=AMBER,
-        ).pack(side="left", padx=12)
-
-        header = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=14, border_width=1, border_color=BORDER)
-        header.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 14))
-        ctk.CTkLabel(
-            header, text="Editar obra" if editing else "Cadastrar nova obra",
-            font=sans(30, "bold"), text_color=TEXT, anchor="w",
-        ).pack(fill="x", padx=24, pady=(20, 4))
-        ctk.CTkLabel(
-            header,
-            text="Mantenha capa, classificação, progresso, lançamento e organização da obra em um único cadastro.",
-            font=sans(13), text_color=TEXT_MUTED, anchor="w",
-        ).pack(fill="x", padx=24, pady=(0, 20))
-
-        body = ctk.CTkFrame(self, fg_color="transparent")
-        body.grid(row=2, column=0, sticky="nsew", padx=6)
-        body.grid_columnconfigure(0, minsize=280)
-        body.grid_columnconfigure(1, weight=1)
-        self._build_left(body)
-        self._build_right(body)
-        self._build_actions()
-
-    def _build_left(self, parent):
-        left = ctk.CTkFrame(parent, fg_color=SURFACE, corner_radius=14, border_width=1, border_color=BORDER)
-        left.grid(row=0, column=0, sticky="new", padx=(0, 10))
-        left.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(left, text="CAPA", font=sans(11, "bold"), text_color=TEXT_MUTED).grid(
-            row=0, column=0, sticky="w", padx=20, pady=(18, 8)
-        )
-        cover = ctk.CTkFrame(left, width=220, height=310, fg_color="#0B0A10", border_width=1, border_color=BORDER, corner_radius=10)
-        cover.grid(row=1, column=0, padx=24, pady=(0, 12))
-        cover.grid_propagate(False)
-        self.cover_preview = ctk.CTkLabel(
-            cover, text="Adicionar capa\nPNG, JPG, WEBP ou GIF", justify="center",
-            font=sans(12, "bold"), text_color=TEXT_MUTED,
-        )
-        self.cover_preview.place(relx=0.5, rely=0.5, anchor="center")
-        ctk.CTkButton(left, text="Selecionar capa", command=self._select_cover, height=38, font=sans(12, "bold")).grid(
-            row=2, column=0, sticky="ew", padx=20, pady=(0, 7)
-        )
-        ctk.CTkButton(
-            left, text="Remover capa", command=self._mark_cover_for_removal, height=34,
-            fg_color="transparent", hover_color=SURFACE_RAISED, border_width=1,
-            border_color=BORDER, text_color=TEXT_MUTED,
-        ).grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 18))
-
-        favorite = ctk.CTkFrame(left, fg_color=SURFACE_LOW, corner_radius=10)
-        favorite.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 18))
-        favorite.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(favorite, text="★ Favorito", font=sans(12, "bold"), anchor="w").grid(
-            row=0, column=0, sticky="w", padx=14, pady=(12, 2)
-        )
-        ctk.CTkLabel(favorite, text="Também pode ser alterado no card.", font=sans(10), text_color=TEXT_DIM, anchor="w").grid(
-            row=1, column=0, sticky="w", padx=14, pady=(0, 12)
-        )
-        self.favorite_var = ctk.BooleanVar(value=False)
-        ctk.CTkSwitch(favorite, text="", variable=self.favorite_var, width=44).grid(row=0, column=1, rowspan=2, padx=14)
-
-    def _label(self, parent, text, row, column=0, span=1, padx=18):
-        ctk.CTkLabel(parent, text=text, font=sans(10, "bold"), text_color=TEXT_MUTED, anchor="w").grid(
-            row=row, column=column, columnspan=span, sticky="ew", padx=padx, pady=(9, 5)
-        )
-
-    def _build_right(self, parent):
-        right = ctk.CTkFrame(parent, fg_color=SURFACE, corner_radius=14, border_width=1, border_color=BORDER)
-        right.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
-        right.grid_columnconfigure(0, weight=1)
-        right.grid_columnconfigure(1, weight=1)
-        row = 0
-        self._label(right, "TÍTULO DA OBRA *", row, 0, 2)
-        self.name_entry = ctk.CTkEntry(right, placeholder_text="Ex.: Nano Machine", height=44, font=sans(14, "bold"))
-        self.name_entry.grid(row=row + 1, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 8))
-        row += 2
-        self._label(right, "CATEGORIA", row, 0)
-        self._label(right, "STATUS DA LEITURA", row, 1)
-        categories = [item["name"] for item in self.repository.list_categories()]
-        self.category_combo = ctk.CTkComboBox(right, values=categories or [""], height=40, font=sans(12), dropdown_font=sans(12))
-        self.category_combo.grid(row=row + 1, column=0, sticky="ew", padx=(18, 7), pady=(0, 8))
-        self.status_menu = ctk.CTkOptionMenu(right, values=list(self.repository.STATUS_OPTIONS), height=40, font=sans(12), dropdown_font=sans(12))
-        self.status_menu.grid(row=row + 1, column=1, sticky="ew", padx=(7, 18), pady=(0, 8))
-        row += 2
-        self._label(right, "TAGS", row, 0, 2)
-        self.tags_entry = ctk.CTkEntry(right, placeholder_text="ação, fantasia, manhwa", height=40, font=sans(12))
-        self.tags_entry.grid(row=row + 1, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 12))
-        row += 2
-
-        progress = ctk.CTkFrame(right, fg_color=SURFACE_LOW, corner_radius=12)
-        progress.grid(row=row, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 12))
-        progress.grid_columnconfigure(0, weight=1)
-        progress.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(progress, text="RASTREAMENTO DE PROGRESSO", font=sans(12, "bold"), anchor="w").grid(
-            row=0, column=0, sticky="w", padx=14, pady=(12, 6)
-        )
-        self.unit_menu = ctk.CTkSegmentedButton(progress, values=list(self.repository.PROGRESS_UNITS), height=31, command=lambda _v: self._refresh_progress_preview())
-        self.unit_menu.grid(row=0, column=1, sticky="e", padx=14, pady=(10, 6))
-        self._label(progress, "ÚLTIMO REGISTRO LIDO", 1, 0, padx=14)
-        self._label(progress, "TOTAL PREVISTO (OPCIONAL)", 1, 1, padx=14)
-        self.current_var = ctk.StringVar(value="0")
-        self.total_var = ctk.StringVar(value="")
-        self.current_entry = ctk.CTkEntry(progress, textvariable=self.current_var, height=40, font=sans(12))
-        self.current_entry.grid(row=2, column=0, sticky="ew", padx=(14, 6), pady=(0, 7))
-        self.total_entry = ctk.CTkEntry(progress, textvariable=self.total_var, placeholder_text="Deixe vazio se ainda estiver em lançamento", height=40, font=sans(12))
-        self.total_entry.grid(row=2, column=1, sticky="ew", padx=(6, 14), pady=(0, 7))
-        self.current_var.trace_add("write", lambda *_: self._refresh_progress_preview())
-        self.total_var.trace_add("write", lambda *_: self._refresh_progress_preview())
-        self.progress_bar = ctk.CTkProgressBar(progress, height=7, fg_color="#0B0A10", progress_color=AMBER)
-        self.progress_bar.grid(row=3, column=0, columnspan=2, sticky="ew", padx=14, pady=(5, 4))
-        self.progress_text = ctk.CTkLabel(progress, text="", font=sans(11, "bold"), text_color=AMBER, anchor="e")
-        self.progress_text.grid(row=4, column=0, columnspan=2, sticky="e", padx=14, pady=(0, 12))
-        row += 1
-
-        rating = ctk.CTkFrame(right, fg_color=SURFACE_LOW, corner_radius=12)
-        rating.grid(row=row, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 12))
-        rating.grid_columnconfigure(0, weight=1)
-        self.rating_preview = ctk.CTkLabel(rating, text="☆☆☆☆☆  Sem avaliação", font=sans(16, "bold"), text_color=TEXT_DIM, anchor="w")
-        self.rating_preview.grid(row=0, column=0, sticky="w", padx=14, pady=12)
-        self.rating_menu = ctk.CTkOptionMenu(rating, values=self.RATING_OPTIONS, width=155, command=self._refresh_rating_preview, font=sans(12), dropdown_font=sans(12))
-        self.rating_menu.grid(row=0, column=1, sticky="e", padx=14, pady=12)
-        row += 1
-
-        self._label(right, "DATA DE INÍCIO", row, 0)
-        self._label(right, "DATA DE CONCLUSÃO", row, 1)
-        self.start_date = DateField(right)
-        self.start_date.grid(row=row + 1, column=0, sticky="ew", padx=(18, 7), pady=(0, 8))
-        self.end_date = DateField(right)
-        self.end_date.grid(row=row + 1, column=1, sticky="ew", padx=(7, 18), pady=(0, 8))
-        row += 2
-
-        self._label(right, "DIA DE LANÇAMENTO / PUBLICAÇÃO", row, 0, 2)
-        self.release_day = ctk.CTkOptionMenu(
-            right, values=["Sem dia fixo", *WEEKDAYS_PT], height=40, font=sans(12), dropdown_font=sans(12)
-        )
-        self.release_day.grid(row=row + 1, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 10))
-        row += 2
-        self._label(right, "SINOPSE", row, 0, 2)
-        self.synopsis_text = ctk.CTkTextbox(right, height=105, corner_radius=9, border_width=1, font=sans(12))
-        self.synopsis_text.grid(row=row + 1, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 10))
-        row += 2
-        self._label(right, "NOTAS PESSOAIS", row, 0, 2)
-        self.notes_text = ctk.CTkTextbox(right, height=105, corner_radius=9, border_width=1, font=sans(12))
-        self.notes_text.grid(row=row + 1, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 18))
-
-    def _build_actions(self):
-        actions = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=14, border_width=1, border_color=BORDER)
-        actions.grid(row=3, column=0, sticky="ew", padx=6, pady=(14, 20))
-        if self.work is not None:
-            ctk.CTkButton(
-                actions, text="Excluir obra", command=self._delete, fg_color="transparent",
-                hover_color="#3A1B22", border_width=1, border_color=RED,
-                text_color="#FFB4AB", height=40,
-            ).pack(side="left", padx=16, pady=14)
-        ctk.CTkButton(
-            actions, text="Cancelar", command=self.on_cancel, fg_color=SURFACE_RAISED,
-            hover_color=BORDER, text_color=TEXT, height=40, width=110,
-        ).pack(side="right", padx=(7, 16), pady=14)
-        ctk.CTkButton(
-            actions, text="Salvar obra", command=self.save, fg_color=AMBER,
-            hover_color=AMBER_BRIGHT, text_color=BLACK_TEXT, font=sans(12, "bold"),
-            height=40, width=135,
-        ).pack(side="right", pady=14)
-
-    def _fill_existing_values(self):
-        if self.work is None:
-            self.status_menu.set("Quero ler")
-            self.unit_menu.set("Página")
-            self.rating_menu.set("Sem avaliação")
-            self.release_day.set("Sem dia fixo")
-            return
-        work = self.work
-        self.name_entry.insert(0, work.name)
-        self.category_combo.set(work.category or "")
-        self.status_menu.set(work.status)
-        self.unit_menu.set(work.progress_unit)
-        self.current_var.set(str(work.progress_current))
-        if work.progress_total is not None:
-            self.total_var.set(str(work.progress_total))
-        self.rating_menu.set("Sem avaliação" if work.rating is None else f"{work.rating:.1f}".replace(".", ","))
-        self.favorite_var.set(work.favorite)
-        self.start_date.set_iso(work.start_date)
-        self.end_date.set_iso(work.end_date)
-        normalized = normalize_weekday(work.release_day)
-        values = ["Sem dia fixo", *WEEKDAYS_PT]
-        if normalized and normalized not in values:
-            values.append(normalized)
-            self.release_day.configure(values=values)
-        self.release_day.set(normalized or "Sem dia fixo")
-        self.tags_entry.insert(0, ", ".join(self.repository.get_tags(work.id)))
-        self.synopsis_text.insert("1.0", work.synopsis or "")
-        self.notes_text.insert("1.0", work.personal_notes or "")
-        if work.cover_path:
-            self._show_cover(work.cover_path)
-
-    def _select_cover(self):
-        path = filedialog.askopenfilename(
-            parent=self.winfo_toplevel(), title="Selecionar capa",
-            filetypes=[("Imagens", "*.png *.jpg *.jpeg *.webp *.gif"), ("Todos os arquivos", "*.*")],
-        )
-        if not path:
-            return
-        try:
-            with Image.open(Path(path)) as image:
-                image.verify()
-        except Exception:
-            messagebox.showerror("Capa inválida", "O arquivo selecionado não é uma imagem válida.", parent=self.winfo_toplevel())
-            return
-        self._selected_cover_source = path
-        self._remove_cover = False
-        self._show_cover(path)
-
-    def _show_cover(self, path):
-        try:
-            with Image.open(Path(path)) as image:
-                image = image.convert("RGB")
-                image.thumbnail((210, 300))
-                rendered = image.copy()
-            self._cover_image = ctk.CTkImage(light_image=rendered, dark_image=rendered, size=rendered.size)
-            self.cover_preview.configure(image=self._cover_image, text="")
-        except Exception:
-            self.cover_preview.configure(image=None, text="Capa indisponível")
-            self._cover_image = None
-
-    def _mark_cover_for_removal(self):
-        self._selected_cover_source = None
-        self._remove_cover = True
-        self._cover_image = None
-        self.cover_preview.configure(image=None, text="Adicionar capa\nPNG, JPG, WEBP ou GIF")
-
-    def _refresh_progress_preview(self):
-        if not hasattr(self, "progress_bar"):
-            return
-        try:
-            current = max(int(self.current_var.get() or 0), 0)
-        except ValueError:
-            current = 0
-        try:
-            total = int(self.total_var.get()) if self.total_var.get().strip() else 0
-        except ValueError:
-            total = 0
-        ratio = min(current / total, 1.0) if total > 0 else 0.0
-        self.progress_bar.set(ratio)
-        unit = self.unit_menu.get() if hasattr(self, "unit_menu") else "Página"
-        if total > 0:
-            plural = "páginas" if unit == "Página" else "capítulos"
-            self.progress_text.configure(text=f"{ratio * 100:.1f}% concluído • {current} / {total} {plural}")
-        elif unit == "Capítulo":
-            self.progress_text.configure(text=f"Último capítulo lido: {current} • Em lançamento")
-        else:
-            self.progress_text.configure(text=f"Página atual: {current} • total ainda não informado")
-
-    def _refresh_rating_preview(self, value):
-        if not hasattr(self, "rating_preview"):
-            return
-        if value == "Sem avaliação":
-            self.rating_preview.configure(text="☆☆☆☆☆  Sem avaliação", text_color=TEXT_DIM)
-            return
-        rating = float(value.replace(",", "."))
-        full = int(rating)
-        half = abs(rating - full - 0.5) < 1e-9
-        remaining = 5 - full - (1 if half else 0)
-        stars = "★" * full + ("½" if half else "") + "☆" * max(remaining, 0)
-        self.rating_preview.configure(text=f"{stars}   {value} / 5", text_color=AMBER)
+        self._build()
+        self._refresh_category_options()
+        self._load()
+        self._refresh_visibility()
 
     @staticmethod
-    def _parse_int(value, field_name, allow_blank=False):
-        value = value.strip()
-        if not value and allow_blank:
-            return None
-        try:
-            return int(value or "0")
-        except ValueError as exc:
-            raise ValueError(f"{field_name} deve ser um número inteiro.") from exc
+    def _field_label(text: str) -> QLabel:
+        label = QLabel(text.upper())
+        label.setObjectName("fieldLabel")
+        return label
 
-    def _rating_value(self):
-        value = self.rating_menu.get()
-        return None if value == "Sem avaliação" else float(value.replace(",", "."))
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        root.addWidget(scroll)
+        page = QWidget()
+        scroll.setWidget(page)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(28, 22, 28, 32)
+        layout.setSpacing(16)
 
-    def save(self):
+        header_row = QHBoxLayout()
+        back = QPushButton("Voltar")
+        back.setObjectName("ghost")
+        back.setIcon(icon("arrow-left", color="#F4EFEA"))
+        back.clicked.connect(self.cancelled)
+        header_row.addWidget(back)
+        header_row.addStretch()
+        layout.addLayout(header_row)
+        layout.addWidget(PageHeader(
+            "Editar obra" if self.work else "Nova obra",
+            "Organize leitura, publicação, progresso, agenda e acesso à obra em um único cadastro.",
+            "Cadastro" if self.work else "Nova entrada",
+        ))
+
+        columns = QHBoxLayout()
+        columns.setSpacing(16)
+        layout.addLayout(columns)
+
+        left = QFrame()
+        left.setObjectName("panel")
+        left.setFixedWidth(310)
+        left_l = QVBoxLayout(left)
+        left_l.setContentsMargins(18, 18, 18, 18)
+        left_l.setSpacing(12)
+        left_l.addWidget(self._field_label("Capa"))
+        self.cover = QLabel("Adicionar capa")
+        self.cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.cover.setFixedSize(274, 382)
+        self.cover.setStyleSheet("background:#0F1012; border:1px solid #2B2E34; border-radius:4px; color:#756E64; font-weight:650;")
+        left_l.addWidget(self.cover, 0, Qt.AlignmentFlag.AlignHCenter)
+        cover_btn = QPushButton("Selecionar capa")
+        cover_btn.setIcon(icon("folder", color="#F4EFEA"))
+        cover_btn.clicked.connect(self._select_cover)
+        left_l.addWidget(cover_btn)
+        remove_cover = QPushButton("Remover capa")
+        remove_cover.setObjectName("ghost")
+        remove_cover.clicked.connect(self._remove_cover_clicked)
+        left_l.addWidget(remove_cover)
+        self.favorite = QCheckBox("Marcar como favorito")
+        left_l.addWidget(self.favorite)
+        hint = QLabel("A capa é copiada para os dados locais e incluída nos backups completos.")
+        hint.setObjectName("dim")
+        hint.setWordWrap(True)
+        left_l.addWidget(hint)
+        left_l.addStretch()
+        columns.addWidget(left)
+
+        right = QVBoxLayout()
+        right.setSpacing(14)
+        columns.addLayout(right, 1)
+
+        basic = QFrame()
+        basic.setObjectName("panel")
+        grid = QGridLayout(basic)
+        grid.setContentsMargins(20, 18, 20, 20)
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(7)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+
+        grid.addWidget(self._field_label("Título da obra *"), 0, 0, 1, 2)
+        self.name = QLineEdit()
+        self.name.setPlaceholderText("Ex.: Nano Machine")
+        grid.addWidget(self.name, 1, 0, 1, 2)
+
+        grid.addWidget(self._field_label("Categoria"), 2, 0)
+        grid.addWidget(self._field_label("Meu status de leitura"), 2, 1)
+        self.category = QComboBox()
+        self.category.setEditable(True)
+        self.category.currentTextChanged.connect(self._sync_category_unit)
+        grid.addWidget(self.category, 3, 0)
+        self.reading_status = QComboBox()
+        self.reading_status.addItems(list(self.repository.STATUS_OPTIONS))
+        grid.addWidget(self.reading_status, 3, 1)
+
+        grid.addWidget(self._field_label("Status da obra / publicação"), 4, 0)
+        grid.addWidget(self._field_label("Tipo de progresso"), 4, 1)
+        self.publication_status = QComboBox()
+        self.publication_status.addItems(list(self.repository.PUBLICATION_STATUS_OPTIONS))
+        self.publication_status.currentTextChanged.connect(self._refresh_visibility)
+        grid.addWidget(self.publication_status, 5, 0)
+        self.progress_unit = QComboBox()
+        self.progress_unit.addItems(list(self.repository.PROGRESS_UNITS))
+        self.progress_unit.currentTextChanged.connect(self._refresh_visibility)
+        grid.addWidget(self.progress_unit, 5, 1)
+
+        grid.addWidget(self._field_label("Tags (separadas por vírgula)"), 6, 0, 1, 2)
+        self.tags = QLineEdit()
+        self.tags.setPlaceholderText("manhwa, ação, ficção")
+        grid.addWidget(self.tags, 7, 0, 1, 2)
+
+        grid.addWidget(self._field_label("Link de leitura"), 8, 0, 1, 2)
+        self.reading_url = QLineEdit()
+        self.reading_url.setPlaceholderText("https://...")
+        grid.addWidget(self.reading_url, 9, 0, 1, 2)
+        right.addWidget(basic)
+
+        progress = QFrame()
+        progress.setObjectName("panel")
+        pg = QGridLayout(progress)
+        pg.setContentsMargins(20, 18, 20, 20)
+        pg.setHorizontalSpacing(14)
+        pg.setVerticalSpacing(7)
+        title = QLabel("Progresso de leitura")
+        title.setObjectName("sectionTitle")
+        pg.addWidget(title, 0, 0, 1, 2)
+        self.current_label = self._field_label("Última página lida")
+        pg.addWidget(self.current_label, 1, 0)
+        self.total_label = self._field_label("Total de páginas")
+        pg.addWidget(self.total_label, 1, 1)
+        self.current = NumericStepper(minimum=0, maximum=10_000_000, value=0)
+        pg.addWidget(self.current, 2, 0)
+        self.total = NumericStepper(minimum=0, maximum=10_000_000, value=0, special_value_text="Não definido")
+        pg.addWidget(self.total, 2, 1)
+        right.addWidget(progress)
+
+        self.release_panel = QFrame()
+        self.release_panel.setObjectName("panel")
+        rg = QGridLayout(self.release_panel)
+        rg.setContentsMargins(20, 18, 20, 20)
+        rg.setHorizontalSpacing(14)
+        rg.setVerticalSpacing(8)
+        release_title = QLabel("Agenda de publicação")
+        release_title.setObjectName("sectionTitle")
+        rg.addWidget(release_title, 0, 0, 1, 2)
+        intro = QLabel("Use uma agenda previsível quando a obra estiver em lançamento. O sistema destaca ontem, hoje, amanhã e capítulos ainda pendentes.")
+        intro.setObjectName("muted")
+        intro.setWordWrap(True)
+        rg.addWidget(intro, 1, 0, 1, 2)
+        rg.addWidget(self._field_label("Frequência"), 2, 0, 1, 2)
+        self.schedule_type = QComboBox()
+        self.schedule_type.addItems(list(self.repository.RELEASE_SCHEDULE_OPTIONS))
+        self.schedule_type.currentTextChanged.connect(self._refresh_schedule_fields)
+        rg.addWidget(self.schedule_type, 3, 0, 1, 2)
+
+        self.weekdays_box = QWidget()
+        wd = QGridLayout(self.weekdays_box)
+        wd.setContentsMargins(0, 0, 0, 0)
+        wd.setSpacing(7)
+        self.weekday_checks = []
+        for index, day in enumerate(WEEKDAYS_PT):
+            cb = QCheckBox(day.replace("-feira", ""))
+            self.weekday_checks.append((day, cb))
+            wd.addWidget(cb, index // 4, index % 4)
+        rg.addWidget(self.weekdays_box, 4, 0, 1, 2)
+
+        self.anchor_box = QWidget()
+        al = QVBoxLayout(self.anchor_box)
+        al.setContentsMargins(0, 0, 0, 0)
+        al.addWidget(self._field_label("Data de um lançamento conhecido"))
+        self.release_anchor = DateField()
+        al.addWidget(self.release_anchor)
+        rg.addWidget(self.anchor_box, 5, 0, 1, 2)
+
+        self.month_box = QWidget()
+        ml = QHBoxLayout(self.month_box)
+        ml.setContentsMargins(0, 0, 0, 0)
+        ml.addWidget(self._field_label("Dia do mês"))
+        self.month_day = NumericStepper(minimum=1, maximum=31, value=1)
+        ml.addWidget(self.month_day)
+        ml.addStretch()
+        rg.addWidget(self.month_box, 6, 0, 1, 2)
+        right.addWidget(self.release_panel)
+
+        dates = QFrame()
+        dates.setObjectName("panel")
+        dg = QGridLayout(dates)
+        dg.setContentsMargins(20, 18, 20, 20)
+        dg.setHorizontalSpacing(14)
+        dg.setVerticalSpacing(8)
+        dg.addWidget(self._field_label("Data de início"), 0, 0)
+        dg.addWidget(self._field_label("Data de conclusão"), 0, 1)
+        self.start_date = DateField()
+        self.end_date = DateField()
+        dg.addWidget(self.start_date, 1, 0)
+        dg.addWidget(self.end_date, 1, 1)
+        dg.addWidget(self._field_label("Avaliação"), 2, 0, 1, 2)
+        self.rating = RatingSlider()
+        dg.addWidget(self.rating, 3, 0, 1, 2)
+        right.addWidget(dates)
+
+        text = QFrame()
+        text.setObjectName("panel")
+        tl = QVBoxLayout(text)
+        tl.setContentsMargins(20, 18, 20, 20)
+        tl.setSpacing(7)
+        tl.addWidget(self._field_label("Sinopse"))
+        self.synopsis = QTextEdit()
+        self.synopsis.setMinimumHeight(110)
+        tl.addWidget(self.synopsis)
+        tl.addWidget(self._field_label("Notas pessoais"))
+        self.notes = QTextEdit()
+        self.notes.setMinimumHeight(110)
+        tl.addWidget(self.notes)
+        right.addWidget(text)
+
+        actions = QHBoxLayout()
+        if self.work:
+            delete = QPushButton("Excluir obra")
+            delete.setObjectName("dangerButton")
+            delete.setIcon(icon("trash", color="#FF9A9A"))
+            delete.clicked.connect(self._delete)
+            actions.addWidget(delete)
+        actions.addStretch()
+        cancel = QPushButton("Cancelar")
+        cancel.clicked.connect(self.cancelled)
+        actions.addWidget(cancel)
+        save = QPushButton("Salvar obra")
+        save.setObjectName("primary")
+        save.setIcon(icon("check", color="#17130A"))
+        save.clicked.connect(self._save)
+        actions.addWidget(save)
+        layout.addLayout(actions)
+
+    def _refresh_category_options(self):
+        current = self.category.currentText().strip() if hasattr(self, "category") else ""
+        self.category.blockSignals(True)
+        self.category.clear()
+        self.category.addItems([item["name"] for item in self.repository.list_categories()])
+        self.category.setCurrentText(current)
+        self.category.blockSignals(False)
+
+    def _sync_category_unit(self, category_name):
+        category_name = (category_name or "").strip()
+        if not category_name:
+            return
+        data = self.repository.get_category(category_name)
+        if not data:
+            return
+        self.progress_unit.blockSignals(True)
+        self.progress_unit.setCurrentText(data.get("progress_unit") or "Página")
+        self.progress_unit.blockSignals(False)
+        self._refresh_visibility()
+
+    def _load(self):
+        if not self.work:
+            self.reading_status.setCurrentText("Quero ler")
+            self.progress_unit.setCurrentText("Página")
+            self.publication_status.setCurrentText("Completo")
+            self.schedule_type.setCurrentText("Sem calendário")
+            self.rating.setValue(None)
+            return
+        work = self.work
+        self.name.setText(work.name)
+        self.category.setCurrentText(work.category or "")
+        self.reading_status.setCurrentText(work.status)
+        self.publication_status.setCurrentText(work.publication_status)
+        self.progress_unit.setCurrentText(work.progress_unit)
+        self.tags.setText(", ".join(self.repository.get_tags(work.id)))
+        self.reading_url.setText(work.reading_url or "")
+        self.current.setValue(int(work.progress_current or 0))
+        self.total.setValue(int(work.progress_total or 0))
+        self.schedule_type.setCurrentText(work.release_schedule_type or "Sem calendário")
+        selected_days = {d.strip() for d in (work.release_days or "").split(",") if d.strip()}
+        for day, cb in self.weekday_checks:
+            cb.setChecked(day in selected_days)
+        self.month_day.setValue(int(work.release_month_day or 1))
+        self.release_anchor.set_iso(work.release_anchor_date)
+        self.start_date.set_iso(work.start_date)
+        self.end_date.set_iso(work.end_date)
+        self.rating.setValue(work.rating)
+        self.favorite.setChecked(bool(work.favorite))
+        self.synopsis.setPlainText(work.synopsis or "")
+        self.notes.setPlainText(work.personal_notes or "")
+        if work.cover_path and Path(work.cover_path).is_file():
+            self._show_cover(work.cover_path)
+
+    def _refresh_visibility(self, *_):
+        unit = self.progress_unit.currentText() if hasattr(self, "progress_unit") else "Página"
+        pub = self.publication_status.currentText() if hasattr(self, "publication_status") else "Completo"
+        chapters = unit == "Capítulo"
+        self.current_label.setText("ÚLTIMO CAPÍTULO LIDO" if chapters else "ÚLTIMA PÁGINA LIDA")
+        self.total_label.setText("TOTAL DE CAPÍTULOS" if chapters else "TOTAL DE PÁGINAS")
+        # For ongoing serialized works, the total is unknown by design.
+        show_total = (not chapters) or pub == "Completo"
+        self.total_label.setVisible(show_total)
+        self.total.setVisible(show_total)
+        self.release_panel.setVisible(chapters and pub in ("Em lançamento", "Em hiato"))
+        if chapters and pub != "Completo":
+            self.total.setValue(0)
+        self._refresh_schedule_fields()
+
+    def _refresh_schedule_fields(self, *_):
+        kind = self.schedule_type.currentText() if hasattr(self, "schedule_type") else "Sem calendário"
+        self.weekdays_box.setVisible(kind == "Semanal")
+        self.anchor_box.setVisible(kind == "Quinzenal")
+        self.month_box.setVisible(kind == "Mensal")
+
+    def _select_cover(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Selecionar capa", "", "Imagens (*.png *.jpg *.jpeg *.webp *.gif)")
+        if path:
+            self._cover_source = path
+            self._remove_cover = False
+            self._show_cover(path)
+
+    def _show_cover(self, path):
+        pix = QPixmap(str(path))
+        if not pix.isNull():
+            self.cover.setPixmap(pix.scaled(268, 376, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+
+    def _remove_cover_clicked(self):
+        self._cover_source = None
+        self._remove_cover = True
+        self.cover.clear()
+        self.cover.setText("Adicionar capa")
+
+    def _save(self):
         try:
-            current = self._parse_int(self.current_entry.get(), "Quantidade lida")
-            total = self._parse_int(self.total_entry.get(), "Total", allow_blank=True)
-            start_date = self.start_date.get_iso("Data de início")
-            end_date = self.end_date.get_iso("Data de conclusão")
+            unit = self.progress_unit.currentText()
+            pub = self.publication_status.currentText()
+            total = self.total.value() or None
+            if unit == "Capítulo" and pub != "Completo":
+                total = None
+            if unit == "Capítulo" and pub == "Completo" and not total:
+                raise ValueError("Informe o total de capítulos para uma obra completa.")
+            start_date = self.start_date.iso_value()
+            end_date = self.end_date.iso_value()
             if start_date and end_date and end_date < start_date:
                 raise ValueError("A data de conclusão não pode ser anterior à data de início.")
-            release = self.release_day.get()
+            days = [day for day, cb in self.weekday_checks if cb.isChecked()]
             data = dict(
-                name=self.name_entry.get().strip(), category=self.category_combo.get().strip(),
-                progress_unit=self.unit_menu.get(), progress_current=current, progress_total=total,
-                status=self.status_menu.get(), release_day=None if release == "Sem dia fixo" else release,
-                synopsis=self.synopsis_text.get("1.0", "end").strip(), rating=self._rating_value(),
-                favorite=self.favorite_var.get(), personal_notes=self.notes_text.get("1.0", "end").strip(),
-                start_date=start_date, end_date=end_date,
+                name=self.name.text().strip(),
+                category=self.category.currentText().strip(),
+                progress_unit=unit,
+                progress_current=self.current.value(),
+                progress_total=total,
+                status=self.reading_status.currentText(),
+                publication_status=pub,
+                release_schedule_type=self.schedule_type.currentText() if pub in ("Em lançamento", "Em hiato") and unit == "Capítulo" else "Sem calendário",
+                release_days=days,
+                release_month_day=self.month_day.value(),
+                release_anchor_date=self.release_anchor.iso_value(),
+                reading_url=self.reading_url.text().strip(),
+                synopsis=self.synopsis.toPlainText().strip(),
+                rating=self.rating.value(),
+                favorite=self.favorite.isChecked(),
+                personal_notes=self.notes.toPlainText().strip(),
+                start_date=start_date,
+                end_date=end_date,
             )
-            if self.work is None:
-                saved = self.repository.create(**data)
-                work_id = saved.id
-            else:
+            if self.work:
                 self.repository.update_work(self.work.id, **data)
                 work_id = self.work.id
-            tags = [x.strip() for x in self.tags_entry.get().split(",") if x.strip()]
-            self.repository.set_tags(work_id, tags)
+            else:
+                work_id = self.repository.create(**data).id
+            self.repository.set_tags(work_id, [t.strip() for t in self.tags.text().split(",") if t.strip()])
             if self._remove_cover:
                 self.repository.remove_cover(work_id)
-            elif self._selected_cover_source:
-                self.repository.set_cover(work_id, self._selected_cover_source)
+            elif self._cover_source:
+                self.repository.set_cover(work_id, self._cover_source)
         except Exception as exc:
-            messagebox.showerror("Não foi possível salvar", str(exc), parent=self.winfo_toplevel())
+            QMessageBox.critical(self, "Não foi possível salvar", str(exc))
             return
-        self.on_saved(work_id)
+        self.saved.emit(work_id)
 
     def _delete(self):
-        if self.work is None:
+        if not self.work:
             return
-        if not messagebox.askyesno("Excluir obra", f"Deseja excluir '{self.work.name}'?", parent=self.winfo_toplevel()):
-            return
-        self.repository.delete_work(self.work.id)
-        self.on_deleted()
+        answer = QMessageBox.question(
+            self, "Excluir obra", f"Deseja excluir '{self.work.name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self.repository.delete_work(self.work.id)
+            self.deleted.emit()

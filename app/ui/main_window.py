@@ -1,50 +1,62 @@
+from __future__ import annotations
+
 import os
-import subprocess
-import sys
 import threading
-from datetime import datetime
-from tkinter import filedialog, messagebox
+from datetime import date, timedelta
+from pathlib import Path
 
-import customtkinter as ctk
+from PySide6.QtCore import Qt, Signal, QTimer, QUrl, QSize
+from PySide6.QtGui import QDesktopServices, QGuiApplication
+from PySide6.QtWidgets import (
+    QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
+    QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea,
+    QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QHeaderView, QAbstractItemView
+)
 
-from app.components.work_card import WorkCard
 from app.paths import APP_ICON_PATH, DATA_DIR
 from app.repositories.sqlite_repository import SQLiteWorkRepository
 from app.services.backup_service import BackupService
 from app.services.settings_service import SettingsService
 from app.services.statistics_service import StatisticsService
 from app.services.sync_engine import SyncEngine
+from app.ui.date_field import DateField
+from app.ui.icons import icon
+from app.ui.theme import AMBER, TEXT, TEXT_MUTED, app_stylesheet
+from app.ui.widgets import MetricCard, NumericStepper, PageHeader, ReleaseMiniCard, WorkCard
 from app.ui.work_details_page import WorkDetailsPage
 from app.ui.work_form_page import WorkFormPage
-from app.ui.date_field import DateField
-from app.ui.theme import (
-    AMBER, AMBER_BRIGHT, BG, BLACK_TEXT, BORDER, GREEN, PURPLE_DARK,
-    SIDEBAR, SURFACE, SURFACE_LOW, SURFACE_RAISED, TEXT, TEXT_DIM, TEXT_MUTED,
-    sans, serif,
-)
+from app.utils.dates import iso_to_br
 from app.version import __version__
-from app.utils.dates import next_release_label
 
 
-class MainWindow(ctk.CTk):
-    GOAL_LABELS = {
-        "books": "Obras concluídas",
-        "pages": "Páginas lidas",
-        "chapters": "Capítulos lidos",
-    }
-    GOAL_TYPES_BY_LABEL = {value: key for key, value in GOAL_LABELS.items()}
+class MainWindow(QMainWindow):
+    syncFinished = Signal(dict, bool)
+    connectionFinished = Signal(dict)
+
+    GOAL_LABELS = {"books": "Obras concluídas", "pages": "Páginas lidas", "chapters": "Capítulos lidos"}
+    GOAL_TYPES_BY_LABEL = {v: k for k, v in GOAL_LABELS.items()}
+
+    NAV = [
+        ("home", "Início", "home"),
+        ("library", "Biblioteca", "library"),
+        ("reading", "Lendo agora", "book-open"),
+        ("goals", "Metas e desafios", "target"),
+        ("statistics", "Estatísticas", "chart"),
+        ("favorites", "Favoritos", "star"),
+        ("categories", "Categorias", "tags"),
+        ("calendar", "Calendário", "calendar"),
+        ("history", "Histórico", "history"),
+    ]
 
     def __init__(self):
         super().__init__()
-        self.title(f"The Reader Codex {__version__}")
-        self.geometry("1420x900")
-        self.minsize(1100, 720)
-        self.configure(fg_color=BG)
+        self.setWindowTitle(f"The Reader Codex {__version__}")
         if APP_ICON_PATH.is_file():
-            try:
-                self.iconbitmap(str(APP_ICON_PATH))
-            except Exception:
-                pass
+            from PySide6.QtGui import QIcon
+            self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
+        self.setStyleSheet(app_stylesheet())
+        self.setMinimumSize(980, 640)
 
         self.repo = SQLiteWorkRepository()
         self.settings_service = SettingsService()
@@ -52,1148 +64,708 @@ class MainWindow(ctk.CTk):
         self.statistics_service = StatisticsService(self.repo)
         self.sync_engine = SyncEngine(self.repo, self.settings_service)
 
-        self.library_search_var = ctk.StringVar(value="")
-        self.library_category_var = ctk.StringVar(value="Todas")
-        self.library_status_var = ctk.StringVar(value="Todos")
-        self.library_tag_var = ctk.StringVar(value="Todas")
-        self.library_results = None
-        self.global_search_var = ctk.StringVar(value="")
         self.current_view = "home"
-        self.current_work_id = None
         self.previous_view = "library"
-        self.category_editing_name = None
-        self.goal_editing = None
-        self.nav_buttons = {}
+        self.current_work_id = None
+        self._first_show = True
         self._sync_running = False
-        self._sync_debounce_job = None
-        self._periodic_sync_job = None
+        self.nav_buttons = {}
+        self.library_filters = {"search": "", "category": "Todas", "status": "Todos", "publication": "Todos", "tag": "Todas"}
+        self.view_scroll_positions = {}
 
         self._build_shell()
-        self.show_home()
-        self._update_sync_label_from_status()
+        self.syncFinished.connect(self._apply_sync_result)
+        self.connectionFinished.connect(self._apply_connection_result)
 
-        settings = self.settings_service.load()
-        if settings.get("sync_enabled"):
-            self.after(1500, self.sync_in_background)
-        self._schedule_periodic_sync()
-        self.after(2500, self._startup_backup)
+        self._apply_inactivity_rule()
+        self.show_home()
+        self._update_sync_status()
+
+        self.periodic_sync = QTimer(self)
+        self.periodic_sync.setInterval(5 * 60 * 1000)
+        self.periodic_sync.timeout.connect(lambda: self.sync_in_background(False))
+        self.periodic_sync.start()
+
+        self.inactivity_timer = QTimer(self)
+        self.inactivity_timer.setInterval(30 * 60 * 1000)
+        self.inactivity_timer.timeout.connect(self._apply_inactivity_rule)
+        self.inactivity_timer.start()
+
+        QTimer.singleShot(2500, self._startup_backup)
+        if self.settings_service.load().get("sync_enabled"):
+            QTimer.singleShot(1500, lambda: self.sync_in_background(False))
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._first_show:
+            self._first_show = False
+            QTimer.singleShot(0, self._center_on_available_screen)
+
+    def _center_on_available_screen(self):
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if not screen:
+            return
+        available = screen.availableGeometry()
+        width = min(1440, max(980, available.width() - 80))
+        height = min(900, max(640, available.height() - 70))
+        width = min(width, available.width() - 20)
+        height = min(height, available.height() - 20)
+        self.resize(width, height)
+        frame = self.frameGeometry()
+        frame.moveCenter(available.center())
+        self.move(frame.topLeft())
+
+    def _nav_icon_color(self, active=False):
+        return AMBER if active else TEXT_MUTED
+
+    def _refresh_nav_icons(self):
+        for key, btn in self.nav_buttons.items():
+            icon_name = btn.property("icon_name")
+            if not icon_name:
+                continue
+            active = btn.property("active") is True
+            btn.setIcon(icon(icon_name, color=self._nav_icon_color(active)))
+            btn.setIconSize(QSize(18, 18))
 
     def _build_shell(self):
-        self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(1, weight=1)
+        root = QWidget()
+        root.setObjectName("appRoot")
+        self.setCentralWidget(root)
+        grid = QGridLayout(root)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(0)
+        grid.setColumnStretch(1, 1)
+        grid.setRowStretch(1, 1)
 
-        self.sidebar = ctk.CTkFrame(
-            self, width=250, corner_radius=0, fg_color=SIDEBAR, border_width=0
-        )
-        self.sidebar.grid(row=0, column=0, rowspan=2, sticky="nsew")
-        self.sidebar.grid_propagate(False)
+        sidebar = QFrame()
+        sidebar.setObjectName("sidebar")
+        sidebar.setFixedWidth(270)
+        sl = QVBoxLayout(sidebar)
+        sl.setContentsMargins(16, 18, 16, 16)
+        sl.setSpacing(8)
 
-        brand = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        brand.pack(fill="x", padx=20, pady=(22, 18))
-        ctk.CTkLabel(
-            brand, text="▣", width=34, height=34, corner_radius=7,
-            fg_color=SURFACE_RAISED, text_color=AMBER, font=sans(17, "bold")
-        ).pack(side="left")
-        brand_text = ctk.CTkFrame(brand, fg_color="transparent")
-        brand_text.pack(side="left", padx=(10, 0))
-        ctk.CTkLabel(
-            brand_text, text="The Reader Codex", font=sans(18, "bold"),
-            text_color=AMBER_BRIGHT, anchor="w"
-        ).pack(anchor="w")
-        ctk.CTkLabel(
-            brand_text, text="BIBLIOTECA PESSOAL", font=sans(9, "bold"),
-            text_color=TEXT_MUTED, anchor="w"
-        ).pack(anchor="w")
+        brand_card = QFrame()
+        brand_card.setObjectName("sidebarTile")
+        brand_l = QHBoxLayout(brand_card)
+        brand_l.setContentsMargins(14, 14, 14, 14)
+        brand_l.setSpacing(10)
+        logo = QLabel()
+        logo.setPixmap(icon("library", color="#E5A93C").pixmap(28, 28))
+        brand_l.addWidget(logo, 0, Qt.AlignmentFlag.AlignTop)
+        brand_text = QVBoxLayout()
+        brand_text.setSpacing(1)
+        name = QLabel("The Reader Codex")
+        name.setObjectName("brand")
+        brand_text.addWidget(name)
+        sub = QLabel("PAINEL LITERÁRIO PESSOAL")
+        sub.setObjectName("brandSub")
+        brand_text.addWidget(sub)
+        brand_l.addLayout(brand_text, 1)
+        sl.addWidget(brand_card)
 
-        self._sidebar_section("MENU PRINCIPAL")
-        for key, text, command in [
-            ("library", "▤  Biblioteca", self.show_library),
-            ("reading", "▥  Lendo Agora", self.show_reading_now),
-            ("goals", "♜  Metas & Desafios", self.show_goals),
-            ("statistics", "⌁  Estatísticas", self.show_statistics),
-            ("history", "◴  Histórico de Sessões", self.show_history),
-        ]:
-            self._sidebar_button(key, text, command)
+        section = QLabel("NAVEGAÇÃO")
+        section.setObjectName("fieldLabel")
+        sl.addWidget(section)
+        for key, text_value, icon_name in self.NAV:
+            btn = QPushButton(text_value)
+            btn.setObjectName("nav")
+            btn.setProperty("active", False)
+            btn.setProperty("icon_name", icon_name)
+            btn.clicked.connect(lambda _=False, k=key: self.navigate(k))
+            self.nav_buttons[key] = btn
+            sl.addWidget(btn)
 
-        self._sidebar_section("COLEÇÕES & ORGANIZAÇÃO")
-        for key, text, command in [
-            ("favorites", "★  Favoritos", self.show_favorites),
-            ("categories", "◈  Categorias", self.show_categories),
-            ("calendar", "□  Calendário", self.show_calendar),
-        ]:
-            self._sidebar_button(key, text, command)
+        sl.addStretch()
 
-        self._sidebar_section("CATEGORIAS")
-        self.sidebar_categories = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        self.sidebar_categories.pack(fill="x", padx=12)
-        self._refresh_sidebar_categories()
+        tools = QLabel("SISTEMA")
+        tools.setObjectName("fieldLabel")
+        sl.addWidget(tools)
 
-        utilities = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        utilities.pack(side="bottom", fill="x", padx=12, pady=(0, 12))
-        ctk.CTkButton(
-            utilities, text="⚙  Configurações", anchor="w", command=self.show_settings,
-            height=32, fg_color="transparent", hover_color=SURFACE_RAISED,
-            text_color=TEXT_MUTED
-        ).pack(fill="x", pady=2)
-        ctk.CTkButton(
-            utilities, text="▣  Backup", anchor="w", command=self.show_backup,
-            height=32, fg_color="transparent", hover_color=SURFACE_RAISED,
-            text_color=TEXT_MUTED
-        ).pack(fill="x", pady=2)
+        settings = QPushButton("Configurações")
+        settings.setObjectName("nav")
+        settings.setProperty("icon_name", "settings")
+        settings.clicked.connect(self.show_settings)
+        self.nav_buttons["settings"] = settings
+        sl.addWidget(settings)
 
-        self.sync_label = ctk.CTkLabel(
-            utilities, text="", text_color=TEXT_DIM, wraplength=210, font=sans(9)
-        )
-        self.sync_label.pack(fill="x", pady=(8, 4))
-        self.sync_button = ctk.CTkButton(
-            utilities, text="☁  Sincronizar agora",
-            command=lambda: self.sync_in_background(show_dialog=True),
-            height=34, fg_color=SURFACE_RAISED, hover_color=BORDER,
-            border_width=1, border_color=BORDER, text_color=TEXT,
-        )
-        self.sync_button.pack(fill="x")
+        backup = QPushButton("Backup")
+        backup.setObjectName("nav")
+        backup.setProperty("icon_name", "backup")
+        backup.clicked.connect(self.show_backup)
+        self.nav_buttons["backup"] = backup
+        sl.addWidget(backup)
 
-        self.topbar = ctk.CTkFrame(self, height=68, fg_color=BG, corner_radius=0)
-        self.topbar.grid(row=0, column=1, sticky="ew", padx=18, pady=(8, 0))
-        self.topbar.grid_columnconfigure(0, weight=1)
-        search = ctk.CTkEntry(
-            self.topbar, textvariable=self.global_search_var,
-            placeholder_text="⌕  Buscar por título, categoria, tag ou status...",
-            height=42, corner_radius=10, font=sans(13),
-        )
-        search.grid(row=0, column=0, sticky="ew", padx=(0, 14), pady=8)
-        search.bind("<Return>", lambda _event: self._run_global_search())
-        ctk.CTkButton(
-            self.topbar, text="＋  Nova Obra", command=self.open_new_work,
-            height=42, width=128, fg_color=AMBER, hover_color=AMBER_BRIGHT,
-            text_color=BLACK_TEXT, font=sans(12, "bold"),
-        ).grid(row=0, column=1, pady=8)
+        sync_card = QFrame()
+        sync_card.setObjectName("sidebarTile")
+        sync_l = QVBoxLayout(sync_card)
+        sync_l.setContentsMargins(14, 14, 14, 14)
+        sync_l.setSpacing(10)
+        sync_title = QLabel("Sincronização")
+        sync_title.setObjectName("sectionTitle")
+        sync_l.addWidget(sync_title)
+        self.sync_label = QLabel()
+        self.sync_label.setObjectName("dim")
+        self.sync_label.setWordWrap(True)
+        sync_l.addWidget(self.sync_label)
+        self.sync_button = QPushButton("Sincronizar agora")
+        self.sync_button.setIcon(icon("sync", color="#17130A"))
+        self.sync_button.setObjectName("primary")
+        self.sync_button.clicked.connect(lambda: self.sync_in_background(True))
+        sync_l.addWidget(self.sync_button)
+        sl.addWidget(sync_card)
 
-        self.content = ctk.CTkScrollableFrame(
-            self, fg_color=BG, corner_radius=0,
-            scrollbar_button_color=SURFACE_RAISED, scrollbar_button_hover_color=BORDER
-        )
-        self.content.grid(row=1, column=1, sticky="nsew", padx=18, pady=(0, 14))
+        grid.addWidget(sidebar, 0, 0, 2, 1)
 
-    def _sidebar_section(self, text):
-        ctk.CTkLabel(
-            self.sidebar, text=text, font=sans(10, "bold"), text_color=TEXT_DIM, anchor="w"
-        ).pack(fill="x", padx=22, pady=(14, 6))
+        top = QFrame()
+        top.setObjectName("topbar")
+        tl = QHBoxLayout(top)
+        tl.setContentsMargins(26, 14, 26, 12)
+        tl.setSpacing(10)
+        self.global_search = QLineEdit()
+        self.global_search.setPlaceholderText("Buscar por título, categoria, tag ou status...")
+        self.global_search.returnPressed.connect(self._global_search)
+        tl.addWidget(self.global_search, 1)
 
-    def _sidebar_button(self, key, text, command):
-        button = ctk.CTkButton(
-            self.sidebar, text=text, anchor="w", command=command, height=38,
-            corner_radius=9, fg_color="transparent", hover_color=SURFACE_RAISED,
-            text_color=TEXT_MUTED, font=sans(12),
-        )
-        button.pack(fill="x", padx=12, pady=2)
-        self.nav_buttons[key] = button
+        self.quick_status = QLabel("Coleção pessoal")
+        self.quick_status.setObjectName("dim")
+        tl.addWidget(self.quick_status)
 
-    def _sync_nav_state(self):
-        active = self.current_view
-        for key, button in self.nav_buttons.items():
-            selected = key == active or (active in ("home", "library", "work_form", "work_details") and key == "library")
-            button.configure(
-                fg_color=AMBER if selected else "transparent",
-                hover_color=AMBER_BRIGHT if selected else SURFACE_RAISED,
-                text_color=BLACK_TEXT if selected else TEXT_MUTED,
-                font=sans(12, "bold" if selected else "normal"),
-            )
+        new = QPushButton("Nova obra")
+        new.setObjectName("primary")
+        new.setIcon(icon("plus", color="#17130A"))
+        new.clicked.connect(self.open_new_work)
+        tl.addWidget(new)
+        grid.addWidget(top, 0, 1)
 
-    def _refresh_sidebar_categories(self):
-        if not hasattr(self, "sidebar_categories"):
-            return
-        for child in self.sidebar_categories.winfo_children():
-            child.destroy()
-        for item in self.repo.list_categories()[:6]:
-            name = item["name"]
-            ctk.CTkButton(
-                self.sidebar_categories, text=f"•  {name}", anchor="w", height=28,
-                fg_color="transparent", hover_color=SURFACE_RAISED, text_color=TEXT_MUTED,
-                font=sans(10), command=lambda n=name: self._open_category_filter(n),
-            ).pack(fill="x", pady=1)
-        if not self.repo.list_categories():
-            ctk.CTkLabel(
-                self.sidebar_categories, text="Nenhuma categoria", text_color=TEXT_DIM,
-                font=sans(9), anchor="w"
-            ).pack(fill="x", padx=10, pady=3)
+        self.stack = QStackedWidget()
+        grid.addWidget(self.stack, 1, 1)
 
-    def _open_category_filter(self, category):
-        self.library_category_var.set(category)
-        self.library_status_var.set("Todos")
-        self.show_library()
+        self._refresh_nav_icons()
 
-    def _open_status_filter(self, status):
-        self.library_status_var.set(status)
-        self.show_library()
-
-    def _run_global_search(self):
-        self.library_search_var.set(self.global_search_var.get().strip())
-        self.show_library()
-
-    def _clear_content(self):
-        for child in self.content.winfo_children():
-            child.destroy()
-        self.library_results = None
-        self._sync_nav_state()
-        self._refresh_sidebar_categories()
-
-    def _header(self, title, subtitle):
-        ctk.CTkLabel(
-            self.content, text=title, font=sans(32, "bold"), text_color=TEXT, anchor="w"
-        ).pack(fill="x", padx=6, pady=(8, 0))
-        ctk.CTkLabel(
-            self.content, text=subtitle, text_color=TEXT_MUTED, font=sans(12), anchor="w"
-        ).pack(fill="x", padx=6, pady=(4, 20))
-
-    @staticmethod
-    def _plural_progress_unit(unit):
-        return "páginas" if unit == "Página" else "capítulos" if unit == "Capítulo" else unit.lower()
-
-    @staticmethod
-    def _format_date(value):
-        if not value:
-            return ""
-        try:
-            return datetime.strptime(value, "%Y-%m-%d").strftime("%d/%m/%Y")
-        except ValueError:
-            return value
-
-    @staticmethod
-    def _format_datetime(value):
-        if not value:
-            return ""
-        try:
-            dt = datetime.fromisoformat(value)
-            if dt.tzinfo:
-                dt = dt.astimezone()
-            return dt.strftime("%d/%m/%Y %H:%M")
-        except ValueError:
-            return value
-
-    def _render_work(self, work, parent=None):
-        parent = parent or self.content
-        total = work.progress_total or 0
-        percent = work.progress_current / total if total and total > 0 else 0
-        unit_plural = self._plural_progress_unit(work.progress_unit)
-        if work.progress_total:
-            progress_text = f"{work.progress_current} / {work.progress_total} {unit_plural} ({min(percent * 100, 100):.0f}%)"
-        elif work.progress_unit == "Capítulo":
-            progress_text = f"Último capítulo lido: {work.progress_current}  •  Em lançamento"
-        else:
-            progress_text = f"Página atual: {work.progress_current}  •  total não informado"
-        tags = self.repo.get_tags(work.id)
-        dates = []
-        if work.start_date:
-            dates.append(f"Início: {self._format_date(work.start_date)}")
-        if work.end_date:
-            dates.append(f"Fim: {self._format_date(work.end_date)}")
-        if work.progress_unit == "Capítulo" and work.progress_total is None and work.release_day:
-            prediction = next_release_label(work.release_day)
-            if prediction:
-                dates.append(f"Próximo lançamento: {prediction}")
-
-        WorkCard(
-            parent,
-            title=work.name,
-            category=work.category,
-            progress_text=progress_text,
-            status=work.status,
-            percent=percent,
-            on_increment=lambda wid=work.id: self._change_progress(wid, 1),
-            on_decrement=lambda wid=work.id: self._change_progress(wid, -1),
-            on_details=lambda wid=work.id: self.open_details(wid),
-            on_favorite=lambda wid=work.id: self._toggle_favorite_from_card(wid),
-            tags_text=", ".join(tags[:4]),
-            dates_text=" | ".join(dates),
-            favorite=work.favorite,
-            rating=work.rating,
-            cover_path=work.cover_path,
-        ).pack(fill="x", pady=7)
-
-    def _change_progress(self, work_id, amount):
-        try:
-            self.repo.increment_progress(work_id, amount)
-        except Exception as exc:
-            messagebox.showerror("Progresso", str(exc), parent=self)
-            return
-        self.refresh_current_view()
-        self._data_changed()
-
-    def refresh_current_view(self):
-        if self.current_view == "work_details" and self.current_work_id:
-            self.open_details(self.current_work_id)
-            return
-        if self.current_view == "work_form":
-            return
-        views = {
-            "home": self.show_home,
-            "library": self.show_library,
-            "reading": self.show_reading_now,
-            "favorites": self.show_favorites,
-            "categories": self.show_categories,
-            "calendar": self.show_calendar,
-            "statistics": self.show_statistics,
-            "goals": self.show_goals,
-            "history": self.show_history,
-            "backup": self.show_backup,
-            "settings": self.show_settings,
+    def navigate(self, key):
+        actions = {
+            "home": self.show_home, "library": self.show_library, "reading": self.show_reading_now,
+            "goals": self.show_goals, "statistics": self.show_statistics, "history": self.show_history,
+            "favorites": self.show_favorites, "categories": self.show_categories,
+            "calendar": self.show_calendar, "settings": self.show_settings, "backup": self.show_backup,
         }
-        views.get(self.current_view, self.show_library)()
+        actions.get(key, self.show_library)()
 
-    def open_new_work(self):
-        self.previous_view = self.current_view if self.current_view not in ("work_form", "work_details") else "library"
-        self.current_view = "work_form"
-        self.current_work_id = None
-        self._clear_content()
-        WorkFormPage(
-            self.content, self.repo, work=None,
-            on_saved=self._after_work_saved,
-            on_cancel=self._return_from_work_page,
-            on_deleted=self.show_library,
-        ).pack(fill="x", expand=True)
+    def _save_current_scroll_position(self):
+        current = self.stack.currentWidget()
+        if isinstance(current, QScrollArea):
+            self.view_scroll_positions[self.current_view] = current.verticalScrollBar().value()
 
-    def open_edit_work(self, work_id):
-        work = self.repo.get_by_id(work_id)
-        if work is None:
-            messagebox.showwarning("Obra", "Essa obra não está mais disponível.", parent=self)
+    def _restore_scroll_position(self, widget, view):
+        if not isinstance(widget, QScrollArea):
             return
-        self.current_view = "work_form"
-        self.current_work_id = work_id
-        self._clear_content()
-        WorkFormPage(
-            self.content, self.repo, work=work,
-            on_saved=self._after_work_saved,
-            on_cancel=lambda: self.open_details(work_id),
-            on_deleted=self._after_work_deleted,
-        ).pack(fill="x", expand=True)
-
-    def open_details(self, work_id):
-        work = self.repo.get_by_id(work_id)
-        if work is None:
-            messagebox.showwarning("Obra", "Essa obra não está mais disponível.", parent=self)
+        value = self.view_scroll_positions.get(view)
+        if value is None:
             return
-        if self.current_view not in ("work_form", "work_details"):
-            self.previous_view = self.current_view
-        self.current_work_id = work_id
-        self.current_view = "work_details"
-        self._clear_content()
-        WorkDetailsPage(
-            self.content, self.repo, work_id,
-            on_back=self._return_from_work_page,
-            on_edit=self.open_edit_work,
-            on_changed=self._details_changed,
-        ).pack(fill="x", expand=True)
+        QTimer.singleShot(0, lambda: widget.verticalScrollBar().setValue(value))
 
-    def _return_from_work_page(self):
-        target = self.previous_view
-        views = {
-            "home": self.show_home,
-            "library": self.show_library,
-            "reading": self.show_reading_now,
-            "favorites": self.show_favorites,
-            "calendar": self.show_calendar,
-            "statistics": self.show_statistics,
-            "goals": self.show_goals,
-            "history": self.show_history,
-        }
-        views.get(target, self.show_library)()
+    def _set_page(self, widget, view):
+        self._save_current_scroll_position()
+        old = self.stack.currentWidget()
+        self.stack.addWidget(widget)
+        self.stack.setCurrentWidget(widget)
+        if old:
+            self.stack.removeWidget(old)
+            old.deleteLater()
+        self.current_view = view
+        self._sync_nav()
+        self._restore_scroll_position(widget, view)
 
-    def _after_work_saved(self, work_id):
-        self._data_changed()
-        self.open_details(work_id)
+    def _sync_nav(self):
+        base = self.current_view
+        if base in ("work_form", "work_details"):
+            base = "library"
+        for key, btn in self.nav_buttons.items():
+            btn.setProperty("active", key == base)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+        self._refresh_nav_icons()
 
-    def _after_work_deleted(self):
-        self._data_changed()
-        self.show_library()
+    def _make_scroll(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(28, 22, 28, 32)
+        layout.setSpacing(14)
+        scroll.setWidget(content)
+        return scroll, layout
 
-    def _details_changed(self):
-        self._data_changed()
-        self._refresh_sidebar_categories()
+    def _bind_work_card(self, card):
+        card.favoriteChanged.connect(self._toggle_favorite)
+        card.progressChanged.connect(self._change_progress)
+        card.detailsRequested.connect(self.open_details)
+        card.readRequested.connect(self._open_reading_link)
 
-    def _toggle_favorite_from_card(self, work_id):
-        work = self.repo.get_by_id(work_id)
-        if work is None:
+    def _add_work_cards(self, layout, works):
+        if not works:
+            empty = QLabel("Nenhuma obra encontrada.")
+            empty.setObjectName("muted")
+            layout.addWidget(empty)
             return
-        try:
-            self.repo.update_work(
-                work.id, name=work.name, category=work.category,
-                progress_unit=work.progress_unit, progress_current=work.progress_current,
-                progress_total=work.progress_total, status=work.status, release_day=work.release_day,
-                synopsis=work.synopsis, rating=work.rating, favorite=not work.favorite,
-                personal_notes=work.personal_notes, start_date=work.start_date, end_date=work.end_date,
-            )
-        except Exception as exc:
-            messagebox.showerror("Favorito", str(exc), parent=self)
-            return
-        self._data_changed()
-        self.refresh_current_view()
+        for work in works:
+            card = WorkCard(work, self.repo.get_tags(work.id), self.repo.get_release_state(work.id))
+            self._bind_work_card(card)
+            layout.addWidget(card)
 
     def show_home(self):
-        self.current_view = "home"
-        self._clear_content()
-        self._header("Biblioteca Pessoal", "Seu acervo, progresso e ritmo de leitura em um só lugar.")
+        scroll, layout = self._make_scroll()
+        layout.addWidget(PageHeader("Visão geral", "Leitura atual, lançamentos e o que merece sua atenção hoje.", "Painel principal"))
         summary = self.statistics_service.summary()
+        metrics = QHBoxLayout()
+        for label, value, ic in [
+            ("Obras no acervo", summary["total_works"], "library"),
+            ("Lendo agora", summary["reading"], "book-open"),
+            ("Concluídas", summary["completed"], "check"),
+            ("Favoritas", summary["favorites"], "star"),
+        ]:
+            metrics.addWidget(MetricCard(label, value, ic))
+        layout.addLayout(metrics)
 
-        cards = ctk.CTkFrame(self.content, fg_color="transparent")
-        cards.pack(fill="x", pady=(0, 18))
-        metrics = [
-            ("OBRAS NO ACERVO", summary["total_works"], "▤"),
-            ("LENDO AGORA", summary["reading"], "◉"),
-            ("CONCLUÍDAS", summary["completed"], "✓"),
-            ("FAVORITAS", summary["favorites"], "★"),
-        ]
-        for label, value, icon in metrics:
-            box = ctk.CTkFrame(
-                cards, fg_color=SURFACE, border_width=1, border_color=BORDER, corner_radius=14
-            )
-            box.pack(side="left", expand=True, fill="both", padx=6)
-            ctk.CTkLabel(box, text=icon, font=sans(16, "bold"), text_color=AMBER).pack(
-                anchor="w", padx=16, pady=(14, 0)
-            )
-            ctk.CTkLabel(box, text=str(value), font=sans(27, "bold"), text_color=TEXT).pack(
-                anchor="w", padx=16, pady=(2, 0)
-            )
-            ctk.CTkLabel(box, text=label, font=sans(9, "bold"), text_color=TEXT_MUTED).pack(
-                anchor="w", padx=16, pady=(0, 14)
-            )
+        digest = self.repo.list_release_digest()
+        heading = QLabel("Lançamentos")
+        heading.setObjectName("sectionTitle")
+        layout.addWidget(heading)
+        release_grid = QGridLayout()
+        release_grid.setHorizontalSpacing(10)
+        columns = [("yesterday", "Ontem"), ("today", "Hoje"), ("tomorrow", "Amanhã")]
+        for col, (key, title) in enumerate(columns):
+            box = QFrame()
+            box.setObjectName("panel")
+            box_l = QVBoxLayout(box)
+            box_l.setContentsMargins(13, 13, 13, 13)
+            cap = QLabel(title)
+            cap.setObjectName("fieldLabel")
+            box_l.addWidget(cap)
+            items = digest[key]
+            if items:
+                for item in items[:5]:
+                    mini = ReleaseMiniCard(item["work_id"], item["title"], f"Capítulo previsto • {iso_to_br(item['date'])}", "pending" if key == "today" else "muted")
+                    mini.opened.connect(self.open_details)
+                    box_l.addWidget(mini)
+            else:
+                none = QLabel("Nenhum lançamento")
+                none.setObjectName("dim")
+                box_l.addWidget(none)
+            box_l.addStretch()
+            release_grid.addWidget(box, 0, col)
+        release_grid.setColumnStretch(0, 1); release_grid.setColumnStretch(1, 1); release_grid.setColumnStretch(2, 1)
+        layout.addLayout(release_grid)
+
+        if digest["pending"]:
+            pending_title = QLabel("Capítulos ainda não lidos")
+            pending_title.setObjectName("sectionTitle")
+            layout.addWidget(pending_title)
+            for item in digest["pending"][:8]:
+                label = f"{item['count']} pendente(s) • desde {iso_to_br(item['since'])}"
+                mini = ReleaseMiniCard(item["work_id"], item["title"], label, "pending")
+                mini.opened.connect(self.open_details)
+                layout.addWidget(mini)
 
         reading = self.repo.list_filtered(status="Lendo")
         if reading:
-            ctk.CTkLabel(
-                self.content, text="Continue lendo", font=sans(22, "bold"),
-                text_color=TEXT, anchor="w"
-            ).pack(fill="x", padx=6, pady=(10, 8))
-            ctk.CTkLabel(
-                self.content, text="Retome rapidamente as obras em andamento.",
-                font=sans(11), text_color=TEXT_MUTED, anchor="w"
-            ).pack(fill="x", padx=6, pady=(0, 8))
-            for work in reading[:3]:
-                self._render_work(work)
-        elif self.repo.list_all():
-            ctk.CTkLabel(
-                self.content, text="Nenhuma obra está marcada como 'Lendo'.",
-                text_color=TEXT_MUTED, anchor="w"
-            ).pack(fill="x", padx=6, pady=12)
-        else:
-            empty = ctk.CTkFrame(
-                self.content, fg_color=SURFACE, border_width=1, border_color=BORDER, corner_radius=16
-            )
-            empty.pack(fill="x", padx=6, pady=20)
-            ctk.CTkLabel(empty, text="Sua biblioteca está vazia", font=sans(22, "bold")).pack(
-                pady=(32, 6)
-            )
-            ctk.CTkLabel(
-                empty, text="Comece seu acervo cadastrando a primeira obra.", text_color=TEXT_MUTED
-            ).pack(pady=(0, 14))
-            ctk.CTkButton(
-                empty, text="＋ Adicionar primeira obra", command=self.open_new_work,
-                fg_color=AMBER, hover_color=AMBER_BRIGHT, text_color=BLACK_TEXT
-            ).pack(pady=(0, 30))
-
-    def show_reading_now(self):
-        self.current_view = "reading"
-        self._clear_content()
-        self._header("Lendo Agora", "Obras em andamento, com acesso rápido ao progresso e aos detalhes.")
-        works = self.repo.list_filtered(status="Lendo")
-        if not works:
-            empty = ctk.CTkFrame(self.content, fg_color=SURFACE, border_width=1, border_color=BORDER, corner_radius=14)
-            empty.pack(fill="x", padx=6, pady=16)
-            ctk.CTkLabel(empty, text="Nenhuma obra em leitura", font=sans(20, "bold"), text_color=TEXT).pack(pady=(24, 5))
-            ctk.CTkLabel(empty, text="Altere o status de uma obra para 'Lendo' e ela aparecerá aqui.", font=sans(12), text_color=TEXT_MUTED).pack(pady=(0, 22))
-            return
-        for work in works:
-            self._render_work(work)
+            title = QLabel("Continue lendo")
+            title.setObjectName("sectionTitle")
+            layout.addWidget(title)
+            self._add_work_cards(layout, reading[:4])
+        layout.addStretch()
+        self._set_page(scroll, "home")
 
     def show_library(self):
-        self.current_view = "library"
-        self._clear_content()
-        self._header("Biblioteca", "Explore seu acervo por título, categoria, status ou marcador.")
-
-        filters = ctk.CTkFrame(
-            self.content, fg_color=SURFACE, border_width=1, border_color=BORDER, corner_radius=14
-        )
-        filters.pack(fill="x", padx=6, pady=(0, 16))
-        for column in range(4):
-            filters.grid_columnconfigure(column, weight=1)
-
-        search = ctk.CTkEntry(
-            filters, textvariable=self.library_search_var,
-            placeholder_text="⌕  Buscar no acervo...", height=42, corner_radius=10
-        )
-        search.grid(row=0, column=0, columnspan=2, sticky="ew", padx=(14, 7), pady=(14, 8))
-        search.bind("<KeyRelease>", lambda _event: self._render_library_results())
-
-        categories = ["Todas"] + [item["name"] for item in self.repo.list_categories()]
-        if self.library_category_var.get() not in categories:
-            self.library_category_var.set("Todas")
-        ctk.CTkOptionMenu(
-            filters, values=categories, variable=self.library_category_var, height=42,
-            command=lambda _value: self._render_library_results(),
-        ).grid(row=0, column=2, sticky="ew", padx=7, pady=(14, 8))
-
-        statuses = ["Todos"] + list(self.repo.STATUS_OPTIONS)
-        if self.library_status_var.get() not in statuses:
-            self.library_status_var.set("Todos")
-        ctk.CTkOptionMenu(
-            filters, values=statuses, variable=self.library_status_var, height=42,
-            command=lambda _value: self._render_library_results(),
-        ).grid(row=0, column=3, sticky="ew", padx=(7, 14), pady=(14, 8))
-
-        tags = ["Todas"] + self.repo.list_tags()
-        if self.library_tag_var.get() not in tags:
-            self.library_tag_var.set("Todas")
-        ctk.CTkOptionMenu(
-            filters, values=tags, variable=self.library_tag_var, height=36,
-            command=lambda _value: self._render_library_results(),
-        ).grid(row=1, column=0, sticky="ew", padx=(14, 7), pady=(0, 14))
-        ctk.CTkLabel(
-            filters, text="Filtro de tag", anchor="w", text_color=TEXT_DIM, font=sans(10)
-        ).grid(row=1, column=1, sticky="w", padx=7, pady=(0, 14))
-        ctk.CTkButton(
-            filters, text="Limpar filtros", command=self._clear_library_filters,
-            fg_color="transparent", hover_color=SURFACE_RAISED, border_width=1,
-            border_color=BORDER, text_color=TEXT_MUTED, height=36
-        ).grid(row=1, column=3, sticky="e", padx=14, pady=(0, 14))
-
-        self.library_results = ctk.CTkFrame(self.content, fg_color="transparent")
-        self.library_results.pack(fill="x", padx=6)
+        scroll, layout = self._make_scroll()
+        layout.addWidget(PageHeader("Biblioteca", "Busque e filtre seu acervo sem perder o contexto da leitura.", "Acervo"))
+        filter_panel = QFrame()
+        filter_panel.setObjectName("panel")
+        fg = QGridLayout(filter_panel)
+        fg.setContentsMargins(14, 14, 14, 14)
+        fg.setHorizontalSpacing(8)
+        self.lib_search = QLineEdit(self.library_filters["search"])
+        self.lib_search.setPlaceholderText("Buscar no acervo...")
+        fg.addWidget(self.lib_search, 0, 0, 1, 2)
+        self.lib_category = QComboBox(); self.lib_category.addItems(["Todas"] + [x["name"] for x in self.repo.list_categories()])
+        self.lib_category.setCurrentText(self.library_filters["category"] if self.library_filters["category"] in [self.lib_category.itemText(i) for i in range(self.lib_category.count())] else "Todas")
+        fg.addWidget(self.lib_category, 0, 2)
+        self.lib_status = QComboBox(); self.lib_status.addItems(["Todos"] + list(self.repo.STATUS_OPTIONS)); self.lib_status.setCurrentText(self.library_filters["status"])
+        fg.addWidget(self.lib_status, 0, 3)
+        self.lib_publication = QComboBox(); self.lib_publication.addItems(["Todos"] + list(self.repo.PUBLICATION_STATUS_OPTIONS)); self.lib_publication.setCurrentText(self.library_filters["publication"])
+        fg.addWidget(self.lib_publication, 1, 0)
+        self.lib_tag = QComboBox(); self.lib_tag.addItems(["Todas"] + self.repo.list_tags()); self.lib_tag.setCurrentText(self.library_filters["tag"] if self.library_filters["tag"] in [self.lib_tag.itemText(i) for i in range(self.lib_tag.count())] else "Todas")
+        fg.addWidget(self.lib_tag, 1, 1)
+        clear = QPushButton("Limpar filtros"); clear.clicked.connect(self._clear_library_filters); fg.addWidget(clear, 1, 3)
+        layout.addWidget(filter_panel)
+        self.library_results = QVBoxLayout()
+        layout.addLayout(self.library_results)
+        layout.addStretch()
+        for widget in (self.lib_search, self.lib_category, self.lib_status, self.lib_publication, self.lib_tag):
+            if isinstance(widget, QLineEdit):
+                widget.textChanged.connect(self._render_library_results)
+            else:
+                widget.currentTextChanged.connect(self._render_library_results)
         self._render_library_results()
+        self._set_page(scroll, "library")
+
+    def _clear_layout(self, layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+            elif item.layout():
+                self._clear_layout(item.layout())
+
+    def _render_library_results(self, *_):
+        if not hasattr(self, "library_results"):
+            return
+        self._clear_layout(self.library_results)
+        self.library_filters = {
+            "search": self.lib_search.text(), "category": self.lib_category.currentText(),
+            "status": self.lib_status.currentText(), "publication": self.lib_publication.currentText(),
+            "tag": self.lib_tag.currentText(),
+        }
+        works = self.repo.list_filtered(
+            search=self.library_filters["search"], category=self.library_filters["category"],
+            status=self.library_filters["status"], publication_status=self.library_filters["publication"],
+            tag=self.library_filters["tag"],
+        )
+        count = QLabel(f"{len(works)} obra(s)")
+        count.setObjectName("dim")
+        self.library_results.addWidget(count)
+        self._add_work_cards(self.library_results, works)
 
     def _clear_library_filters(self):
-        self.library_search_var.set("")
-        self.library_category_var.set("Todas")
-        self.library_status_var.set("Todos")
-        self.library_tag_var.set("Todas")
-        self._render_library_results()
+        self.lib_search.clear(); self.lib_category.setCurrentText("Todas"); self.lib_status.setCurrentText("Todos"); self.lib_publication.setCurrentText("Todos"); self.lib_tag.setCurrentText("Todas")
 
-    def _render_library_results(self):
-        if self.library_results is None or not self.library_results.winfo_exists():
-            return
-        for child in self.library_results.winfo_children():
-            child.destroy()
-        works = self.repo.list_filtered(
-            search=self.library_search_var.get(),
-            category=self.library_category_var.get(),
-            status=self.library_status_var.get(),
-            tag=self.library_tag_var.get(),
-        )
-        if not works:
-            ctk.CTkLabel(
-                self.library_results,
-                text="Nenhuma obra encontrada com os filtros atuais.",
-                anchor="w",
-            ).pack(fill="x", pady=18)
-            return
-        ctk.CTkLabel(
-            self.library_results,
-            text=f"{len(works)} obra(s) encontrada(s)",
-            anchor="w",
-            text_color=("gray35", "gray70"),
-        ).pack(fill="x", pady=(0, 4))
-        for work in works:
-            self._render_work(work, self.library_results)
+    def show_reading_now(self):
+        scroll, layout = self._make_scroll()
+        layout.addWidget(PageHeader("Lendo agora", "Obras com seu status de leitura marcado como Lendo.", "Fila ativa"))
+        self._add_work_cards(layout, self.repo.list_filtered(status="Lendo"))
+        layout.addStretch()
+        self._set_page(scroll, "reading")
 
     def show_favorites(self):
-        self.current_view = "favorites"
-        self._clear_content()
-        self._header("Favoritos", "Obras marcadas como favoritas, independentemente da nota.")
-        favorites = self.repo.list_filtered(favorites_only=True)
-        if not favorites:
-            ctk.CTkLabel(self.content, text="Nenhuma obra favorita.").pack(anchor="w")
-            return
-        for work in favorites:
-            self._render_work(work)
+        scroll, layout = self._make_scroll()
+        layout.addWidget(PageHeader("Favoritos", "Sua seleção pessoal, independente da avaliação.", "Curadoria"))
+        self._add_work_cards(layout, self.repo.list_filtered(favorites_only=True))
+        layout.addStretch()
+        self._set_page(scroll, "favorites")
 
     def show_categories(self):
-        self.current_view = "categories"
-        self._clear_content()
-        editing = self.category_editing_name
-        self._header("Categorias", "Crie e renomeie categorias diretamente nesta página.")
-        form = ctk.CTkFrame(self.content, fg_color=SURFACE, border_width=1, border_color=BORDER, corner_radius=12)
-        form.pack(fill="x", pady=(0, 16))
-        self.new_category_entry = ctk.CTkEntry(
-            form, placeholder_text="Nova categoria: Livro, Mangá, HQ, Artigo...", height=40, font=sans(12)
-        )
-        self.new_category_entry.pack(side="left", expand=True, fill="x", padx=(12, 8), pady=12)
-        if editing:
-            self.new_category_entry.insert(0, editing)
-        self.new_category_entry.bind("<Return>", lambda _event: self._save_category_form())
-        ctk.CTkButton(
-            form, text="Salvar nome" if editing else "Adicionar categoria",
-            command=self._save_category_form, height=40, font=sans(12, "bold")
-        ).pack(side="right", padx=(0, 8), pady=12)
-        if editing:
-            ctk.CTkButton(
-                form, text="Cancelar", command=self._cancel_category_edit, height=40,
-                fg_color=SURFACE_RAISED, hover_color=BORDER, text_color=TEXT
-            ).pack(side="right", padx=(0, 8), pady=12)
-
-        categories = self.repo.list_categories()
-        if not categories:
-            ctk.CTkLabel(
-                self.content,
-                text="Ainda não há categorias. Você também pode digitar uma categoria ao cadastrar uma obra.",
-                anchor="w", wraplength=760, font=sans(12), text_color=TEXT_MUTED,
-            ).pack(fill="x", pady=12)
-            return
-        for item in categories:
-            row = ctk.CTkFrame(self.content, fg_color=SURFACE, border_width=1, border_color=BORDER, corner_radius=10)
-            row.pack(fill="x", pady=5)
-            ctk.CTkLabel(row, text=item["name"], font=sans(14, "bold"), anchor="w").pack(
-                side="left", padx=12, pady=12
-            )
-            ctk.CTkLabel(row, text=f"{item['work_count']} obra(s)", text_color=TEXT_MUTED, font=sans(11)).pack(
-                side="left", padx=8
-            )
-            ctk.CTkButton(
-                row, text="Excluir", width=70, fg_color="transparent", border_width=1,
-                command=lambda name=item["name"]: self._delete_category(name),
-            ).pack(side="right", padx=(6, 12), pady=8)
-            ctk.CTkButton(
-                row, text="Renomear", width=85, command=lambda name=item["name"]: self._start_category_edit(name),
-            ).pack(side="right", padx=6, pady=8)
-
-    def _save_category_form(self):
-        try:
-            if self.category_editing_name:
-                self.repo.rename_category(self.category_editing_name, self.new_category_entry.get())
-                self.category_editing_name = None
-            else:
-                self.repo.create_category(self.new_category_entry.get())
-        except Exception as exc:
-            messagebox.showerror("Categoria", str(exc), parent=self)
-            return
-        self._data_changed()
-        self.show_categories()
-
-    def _start_category_edit(self, old_name):
-        self.category_editing_name = old_name
-        self.show_categories()
-
-    def _cancel_category_edit(self):
-        self.category_editing_name = None
-        self.show_categories()
-
-    def _delete_category(self, name):
-        if not messagebox.askyesno("Excluir categoria", f"Deseja excluir a categoria '{name}'?", parent=self):
-            return
-        try:
-            self.repo.delete_category(name)
-        except Exception as exc:
-            messagebox.showerror("Categoria", str(exc), parent=self)
-            return
-        if self.category_editing_name == name:
-            self.category_editing_name = None
-        self._data_changed()
-        self.show_categories()
+        scroll, layout = self._make_scroll()
+        layout.addWidget(PageHeader("Categorias", "Crie e renomeie categorias definindo se o progresso será por páginas ou capítulos.", "Organização"))
+        add_panel = QFrame(); add_panel.setObjectName("panel")
+        al = QGridLayout(add_panel); al.setContentsMargins(14, 14, 14, 14); al.setHorizontalSpacing(10)
+        new_name = QLineEdit(); new_name.setPlaceholderText("Nova categoria")
+        al.addWidget(new_name, 0, 0)
+        new_unit = QComboBox(); new_unit.addItems(["Página", "Capítulo"])
+        al.addWidget(new_unit, 0, 1)
+        add = QPushButton("Adicionar"); add.setObjectName("primary"); add.setIcon(icon("plus", color="#17130A"))
+        def add_category():
+            try: self.repo.create_category(new_name.text(), new_unit.currentText())
+            except Exception as exc: QMessageBox.critical(self, "Categoria", str(exc)); return
+            self._data_changed(); self.show_categories()
+        add.clicked.connect(add_category); al.addWidget(add, 0, 2)
+        layout.addWidget(add_panel)
+        for item in self.repo.list_categories():
+            row = QFrame(); row.setObjectName("panel")
+            rl = QGridLayout(row); rl.setContentsMargins(14, 10, 14, 10); rl.setHorizontalSpacing(10)
+            entry = QLineEdit(item["name"]); rl.addWidget(entry, 0, 0)
+            unit = QComboBox(); unit.addItems(["Página", "Capítulo"]); unit.setCurrentText(item.get("progress_unit") or "Página"); rl.addWidget(unit, 0, 1)
+            count = QLabel(f"{item['work_count']} obra(s)"); count.setObjectName("dim"); rl.addWidget(count, 0, 2)
+            save = QPushButton("Salvar"); save.setIcon(icon("check", color="#F4EFEA"))
+            def rename(_=False, old=item["name"], e=entry, u=unit):
+                try: self.repo.rename_category(old, e.text(), u.currentText())
+                except Exception as exc: QMessageBox.critical(self, "Categoria", str(exc)); return
+                self._data_changed(); self.show_categories()
+            save.clicked.connect(rename); rl.addWidget(save, 0, 3)
+            delete = QPushButton(); delete.setIcon(icon("trash", color="#FF9A9A")); delete.setObjectName("dangerButton"); delete.setFixedWidth(42)
+            def delete_cat(_=False, name=item["name"]):
+                try: self.repo.delete_category(name)
+                except Exception as exc: QMessageBox.critical(self, "Categoria", str(exc)); return
+                self._data_changed(); self.show_categories()
+            delete.clicked.connect(delete_cat); rl.addWidget(delete, 0, 4)
+            layout.addWidget(row)
+        layout.addStretch()
+        self._set_page(scroll, "categories")
 
     def show_calendar(self):
-        self.current_view = "calendar"
-        self._clear_content()
-        self._header("Calendário", "Datas de leitura e próximas previsões semanais de lançamento.")
-        events = self.repo.list_calendar_events()
-        if not events:
-            ctk.CTkLabel(self.content, text="Nenhum evento de leitura registrado.").pack(anchor="w")
-            return
-        current_date = None
-        for event in events:
-            if event["date"] != current_date:
-                current_date = event["date"]
-                ctk.CTkLabel(
-                    self.content,
-                    text=self._format_date(current_date),
-                    font=sans(16, "bold"),
-                    anchor="w",
-                ).pack(fill="x", pady=(14, 4))
-            button = ctk.CTkButton(
-                self.content,
-                text=f"{event['type']}: {event['title']}",
-                anchor="w",
-                fg_color="transparent",
-                border_width=1,
-                command=lambda wid=event["work_id"]: self.open_details(wid),
-            )
-            button.pack(fill="x", padx=8, pady=3)
+        scroll, layout = self._make_scroll()
+        layout.addWidget(PageHeader("Calendário", "Lançamentos previstos e marcos da sua leitura.", "Agenda"))
+        digest = self.repo.list_release_digest()
+        summary = QHBoxLayout()
+        for key, title in (("yesterday", "Ontem"), ("today", "Hoje"), ("tomorrow", "Amanhã")):
+            box = QFrame(); box.setObjectName("panel"); bl = QVBoxLayout(box); bl.setContentsMargins(13,13,13,13)
+            cap = QLabel(title); cap.setObjectName("fieldLabel"); bl.addWidget(cap)
+            for item in digest[key] or []:
+                mini = ReleaseMiniCard(item["work_id"], item["title"], iso_to_br(item["date"]), "pending" if key == "today" else "muted")
+                mini.opened.connect(self.open_details); bl.addWidget(mini)
+            if not digest[key]:
+                none = QLabel("Nenhum lançamento"); none.setObjectName("dim"); bl.addWidget(none)
+            bl.addStretch(); summary.addWidget(box)
+        layout.addLayout(summary)
+        title = QLabel("Próximos eventos"); title.setObjectName("sectionTitle"); layout.addWidget(title)
+        for event in self.repo.list_calendar_events(horizon_days=60):
+            row = QPushButton(f"{iso_to_br(event['date'])}   •   {event['type']}   •   {event['title']}")
+            row.setStyleSheet("text-align:left;")
+            row.clicked.connect(lambda _=False, wid=event["work_id"]: self.open_details(wid))
+            layout.addWidget(row)
+        layout.addStretch()
+        self._set_page(scroll, "calendar")
 
     def show_statistics(self):
-        self.current_view = "statistics"
-        self._clear_content()
-        self._header("Estatísticas", "Visão geral da sua biblioteca e do progresso de leitura.")
+        scroll, layout = self._make_scroll()
+        layout.addWidget(PageHeader("Estatísticas", "Uma leitura rápida do seu acervo e ritmo atual.", "Análise"))
         summary = self.statistics_service.summary()
-        rows = [
-            ("Obras cadastradas", summary["total_works"]),
-            ("Lendo agora", summary["reading"]),
-            ("Obras concluídas", summary["completed"]),
-            ("Favoritas", summary["favorites"]),
-            ("Páginas registradas como lidas", summary["pages_read"]),
-            ("Capítulos registrados como lidos", summary["chapters_read"]),
-            ("Avaliação média", str(summary["average_rating"]).replace(".", ",")),
-            ("Categoria mais concluída", summary["top_category"]),
-            ("Progresso médio das obras com total definido", f"{summary['average_progress']}%".replace(".", ",")),
+        grid = QGridLayout(); grid.setSpacing(10)
+        values = [
+            ("Obras cadastradas", summary["total_works"], "library"), ("Lendo agora", summary["reading"], "book-open"),
+            ("Concluídas", summary["completed"], "check"), ("Favoritas", summary["favorites"], "star"),
+            ("Páginas lidas", summary["pages_read"], "library"), ("Capítulos lidos", summary["chapters_read"], "book-open"),
+            ("Avaliação média", str(summary["average_rating"]).replace(".", ","), "star"),
+            ("Progresso médio", f"{summary['average_progress']}%".replace(".", ","), "chart"),
         ]
-        for label, value in rows:
-            row = ctk.CTkFrame(self.content)
-            row.pack(fill="x", pady=5)
-            ctk.CTkLabel(row, text=label, anchor="w").pack(side="left", padx=12, pady=10)
-            ctk.CTkLabel(row, text=str(value), font=sans(14, "bold")).pack(side="right", padx=12, pady=10)
-
-    def show_goals(self):
-        self.current_view = "goals"
-        self._clear_content()
-        editing = self.goal_editing
-        self._header("Metas", "Crie e edite objetivos diretamente nesta página. O progresso é atualizado automaticamente.")
-
-        form = ctk.CTkFrame(self.content, fg_color=SURFACE, border_width=1, border_color=BORDER, corner_radius=12)
-        form.pack(fill="x", pady=(0, 16))
-        form.grid_columnconfigure(0, weight=2)
-        form.grid_columnconfigure(1, weight=1)
-        form.grid_columnconfigure(2, weight=1)
-        form.grid_columnconfigure(3, weight=1)
-        self.goal_title = ctk.CTkEntry(form, placeholder_text="Ex.: Ler 12 obras no ano", height=40, font=sans(12))
-        self.goal_title.grid(row=0, column=0, sticky="ew", padx=(12, 6), pady=(12, 6))
-        self.goal_target = ctk.CTkEntry(form, placeholder_text="Meta", height=40, font=sans(12))
-        self.goal_target.grid(row=0, column=1, sticky="ew", padx=6, pady=(12, 6))
-        self.goal_type = ctk.CTkOptionMenu(form, values=list(self.GOAL_TYPES_BY_LABEL), height=40, font=sans(12), dropdown_font=sans(12))
-        self.goal_type.set("Obras concluídas")
-        self.goal_type.grid(row=0, column=2, sticky="ew", padx=6, pady=(12, 6))
-        ctk.CTkButton(
-            form, text="Salvar alterações" if editing else "Adicionar meta",
-            command=self._save_goal_form, height=40, font=sans(12, "bold")
-        ).grid(row=0, column=3, sticky="ew", padx=(6, 12), pady=(12, 6))
-        self.goal_start = DateField(form, placeholder="Início DD/MM/AAAA (opcional)")
-        self.goal_start.grid(row=1, column=0, columnspan=2, sticky="ew", padx=(12, 6), pady=(6, 12))
-        self.goal_end = DateField(form, placeholder="Fim DD/MM/AAAA (opcional)")
-        self.goal_end.grid(row=1, column=2, sticky="ew", padx=(6, 6), pady=(6, 12))
-        if editing:
-            self.goal_title.insert(0, editing["title"])
-            self.goal_target.insert(0, str(editing["target_value"]))
-            self.goal_type.set(self.GOAL_LABELS.get(editing["goal_type"], editing["goal_type"]))
-            self.goal_start.set_iso(editing.get("start_date"))
-            self.goal_end.set_iso(editing.get("end_date"))
-            ctk.CTkButton(
-                form, text="Cancelar edição", command=self._cancel_goal_edit, height=40,
-                fg_color=SURFACE_RAISED, hover_color=BORDER, text_color=TEXT
-            ).grid(row=1, column=3, sticky="ew", padx=(6, 12), pady=(6, 12))
-
-        goals = self.repo.list_goals()
-        if not goals:
-            ctk.CTkLabel(self.content, text="Nenhuma meta cadastrada.", font=sans(12), text_color=TEXT_MUTED).pack(anchor="w")
-            return
-        for goal in goals:
-            current = int(goal["current_value"] or 0)
-            target = int(goal["target_value"] or 1)
-            percent = min(current / target, 1)
-            card = ctk.CTkFrame(self.content, fg_color=SURFACE, border_width=1, border_color=BORDER, corner_radius=10)
-            card.pack(fill="x", pady=6)
-            header = ctk.CTkFrame(card, fg_color="transparent")
-            header.pack(fill="x", padx=12, pady=(10, 2))
-            ctk.CTkLabel(header, text=goal["title"], font=sans(15, "bold"), anchor="w").pack(side="left", expand=True, fill="x")
-            ctk.CTkButton(header, text="Editar", width=70, command=lambda item=goal: self._start_goal_edit(item)).pack(side="right", padx=(6, 0))
-            ctk.CTkButton(
-                header, text="Excluir", width=70, fg_color="transparent", border_width=1,
-                command=lambda gid=goal["id"], title=goal["title"]: self._delete_goal(gid, title),
-            ).pack(side="right", padx=6)
-            progress = ctk.CTkProgressBar(card)
-            progress.set(percent)
-            progress.pack(fill="x", padx=12, pady=4)
-            period = ""
-            if goal.get("start_date") or goal.get("end_date"):
-                period = f" • {self._format_date(goal.get('start_date')) or '...'} a {self._format_date(goal.get('end_date')) or '...'}"
-            label = self.GOAL_LABELS.get(goal["goal_type"], goal["goal_type"])
-            ctk.CTkLabel(card, text=f"{current} / {target} • {label}{period}", anchor="w", font=sans(11)).pack(
-                fill="x", padx=12, pady=(0, 10)
-            )
-
-    def _save_goal_form(self):
-        try:
-            goal_type = self.GOAL_TYPES_BY_LABEL[self.goal_type.get()]
-            kwargs = dict(
-                title=self.goal_title.get(), goal_type=goal_type, target_value=self.goal_target.get(),
-                start_date=self.goal_start.get_iso("Data inicial"), end_date=self.goal_end.get_iso("Data final"),
-            )
-            if self.goal_editing:
-                self.repo.update_goal(self.goal_editing["id"], **kwargs)
-                self.goal_editing = None
-            else:
-                self.repo.create_goal(**kwargs)
-        except Exception as exc:
-            messagebox.showwarning("Meta inválida", str(exc), parent=self)
-            return
-        self._data_changed()
-        self.show_goals()
-
-    def _start_goal_edit(self, goal):
-        self.goal_editing = dict(goal)
-        self.show_goals()
-
-    def _cancel_goal_edit(self):
-        self.goal_editing = None
-        self.show_goals()
-
-    def _delete_goal(self, goal_id, title):
-        if not messagebox.askyesno("Excluir meta", f"Deseja excluir a meta '{title}'?", parent=self):
-            return
-        self.repo.delete_goal(goal_id)
-        if self.goal_editing and self.goal_editing.get("id") == goal_id:
-            self.goal_editing = None
-        self._data_changed()
-        self.show_goals()
+        for i, data in enumerate(values): grid.addWidget(MetricCard(*data), i//4, i%4)
+        layout.addLayout(grid)
+        box = QFrame(); box.setObjectName("panel"); bl = QVBoxLayout(box); bl.setContentsMargins(18,16,18,16)
+        cap = QLabel("Categoria em destaque"); cap.setObjectName("fieldLabel"); bl.addWidget(cap)
+        val = QLabel(summary["top_category"]); val.setObjectName("sectionTitle"); bl.addWidget(val)
+        layout.addWidget(box); layout.addStretch()
+        self._set_page(scroll, "statistics")
 
     def show_history(self):
-        self.current_view = "history"
-        self._clear_content()
-        self._header("Histórico", "Alterações de progresso e status registradas automaticamente.")
-        rows = self.repo.list_history()
-        if not rows:
-            ctk.CTkLabel(self.content, text="Ainda não há registros.").pack(anchor="w")
-            return
-        for row in rows:
-            frame = ctk.CTkFrame(self.content)
-            frame.pack(fill="x", pady=3)
-            ctk.CTkLabel(frame, text=row["name"], font=sans(13, "bold"), anchor="w").pack(
-                side="left", padx=(12, 8), pady=8
-            )
-            ctk.CTkLabel(frame, text=row["description"], anchor="w").pack(side="left", padx=8, pady=8)
-            ctk.CTkLabel(
-                frame,
-                text=self._format_datetime(row["created_at"]),
-                text_color=("gray35", "gray70"),
-            ).pack(side="right", padx=12, pady=8)
+        scroll, layout = self._make_scroll()
+        layout.addWidget(PageHeader("Histórico", "Alterações de progresso e status registradas pelo sistema.", "Registro"))
+        rows = self.repo.list_history(500)
+        table = QTableWidget(len(rows), 3)
+        table.setHorizontalHeaderLabels(["Data", "Obra", "Evento"])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        table.verticalHeader().setVisible(False)
+        table.setAlternatingRowColors(True)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        for r, item in enumerate(rows):
+            raw = str(item.get("created_at", ""))
+            display = raw[:10]
+            try: display = iso_to_br(display) + (" " + raw[11:16] if len(raw) >= 16 else "")
+            except Exception: pass
+            table.setItem(r, 0, QTableWidgetItem(display))
+            table.setItem(r, 1, QTableWidgetItem(item.get("name", "")))
+            table.setItem(r, 2, QTableWidgetItem(item.get("description", "")))
+        table.setMinimumHeight(450)
+        layout.addWidget(table); layout.addStretch()
+        self._set_page(scroll, "history")
+
+    def show_goals(self):
+        scroll, layout = self._make_scroll()
+        layout.addWidget(PageHeader("Metas e desafios", "Metas calculadas automaticamente a partir do seu histórico.", "Planejamento"))
+        form = QFrame(); form.setObjectName("panel"); fg = QGridLayout(form); fg.setContentsMargins(14,14,14,14); fg.setHorizontalSpacing(10)
+        title = QLineEdit(); title.setPlaceholderText("Ex.: Ler 12 obras no ano"); fg.addWidget(title, 0, 0, 1, 2)
+        target = NumericStepper(minimum=1, maximum=10_000_000, value=1); fg.addWidget(target, 0, 2)
+        kind = QComboBox(); kind.addItems(list(self.GOAL_TYPES_BY_LABEL)); fg.addWidget(kind, 0, 3)
+        start = DateField(); end = DateField(); fg.addWidget(start, 1, 0, 1, 2); fg.addWidget(end, 1, 2, 1, 2)
+        add = QPushButton("Adicionar meta"); add.setObjectName("primary"); add.setIcon(icon("plus", color="#17130A"))
+        def add_goal():
+            try: self.repo.create_goal(title.text(), self.GOAL_TYPES_BY_LABEL[kind.currentText()], target.value(), start.iso_value(), end.iso_value())
+            except Exception as exc: QMessageBox.critical(self, "Meta", str(exc)); return
+            self._data_changed(); self.show_goals()
+        add.clicked.connect(add_goal); fg.addWidget(add, 2, 3)
+        layout.addWidget(form)
+        for goal in self.repo.list_goals():
+            card = QFrame(); card.setObjectName("panel"); cl = QGridLayout(card); cl.setContentsMargins(14,12,14,12); cl.setHorizontalSpacing(10)
+            name = QLineEdit(goal["title"]); cl.addWidget(name, 0, 0, 1, 2)
+            tgt = NumericStepper(minimum=1, maximum=10_000_000, value=int(goal["target_value"])); cl.addWidget(tgt, 0, 2)
+            typ = QComboBox(); typ.addItems(list(self.GOAL_TYPES_BY_LABEL)); typ.setCurrentText(self.GOAL_LABELS.get(goal["goal_type"], "Obras concluídas")); cl.addWidget(typ, 0, 3)
+            current = int(goal["current_value"] or 0); target_v = max(1, int(goal["target_value"] or 1))
+            bar = QProgressBar(); bar.setRange(0,1000); bar.setValue(min(int(current/target_v*1000),1000)); cl.addWidget(bar,1,0,1,3)
+            stat = QLabel(f"{current} / {target_v}"); stat.setObjectName("pending"); cl.addWidget(stat,1,3)
+            save = QPushButton("Salvar"); save.setIcon(icon("check", color="#F4EFEA"))
+            def save_goal(_=False, g=goal, n=name, t=tgt, ty=typ):
+                try: self.repo.update_goal(g["id"], title=n.text(), goal_type=self.GOAL_TYPES_BY_LABEL[ty.currentText()], target_value=t.value(), start_date=g.get("start_date"), end_date=g.get("end_date"))
+                except Exception as exc: QMessageBox.critical(self, "Meta", str(exc)); return
+                self._data_changed(); self.show_goals()
+            save.clicked.connect(save_goal); cl.addWidget(save,2,2)
+            delete = QPushButton("Excluir"); delete.setObjectName("dangerButton"); delete.setIcon(icon("trash", color="#FF9A9A"))
+            delete.clicked.connect(lambda _=False, gid=goal["id"]: self._delete_goal(gid)); cl.addWidget(delete,2,3)
+            layout.addWidget(card)
+        layout.addStretch(); self._set_page(scroll, "goals")
+
+    def _delete_goal(self, goal_id):
+        self.repo.delete_goal(goal_id); self._data_changed(); self.show_goals()
 
     def show_backup(self):
-        self.current_view = "backup"
-        self._clear_content()
-        self._header("Backup e dados", "Exporte dados em JSON ou um backup completo com as capas.")
-        buttons = [
-            ("Exportar dados para JSON", self.export_json),
-            ("Importar dados de JSON", self.import_json),
-            ("Exportar backup completo (.zip)", self.export_full_backup),
-            ("Importar backup completo (.zip)", self.import_full_backup),
-            ("Criar backup automático agora", self.manual_backup),
-        ]
-        for label, command in buttons:
-            ctk.CTkButton(self.content, text=label, command=command).pack(anchor="w", pady=6)
-        ctk.CTkLabel(
-            self.content,
-            text="O JSON contém metadados. O ZIP é a opção indicada para transferir a biblioteca entre computadores porque inclui as capas.",
-            wraplength=820,
-            justify="left",
-            anchor="w",
-            text_color=("gray35", "gray70"),
-        ).pack(fill="x", pady=(14, 0))
-
-    def export_json(self):
-        path = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            filetypes=[("JSON", "*.json")],
-            initialfile="the-reader-codex-export.json",
-        )
-        if not path:
-            return
-        try:
-            self.backup_service.export_json(path)
-        except Exception as exc:
-            messagebox.showerror("Exportação", str(exc), parent=self)
-            return
-        messagebox.showinfo("Exportação concluída", f"Dados exportados para:\n{path}", parent=self)
-
-    def import_json(self):
-        path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
-        if not path:
-            return
-        if not messagebox.askyesno("Importar dados", "A importação substituirá os dados locais atuais. Continuar?", parent=self):
-            return
-        try:
-            self.backup_service.create_automatic_backup()
-            self.backup_service.import_json(path)
-        except Exception as exc:
-            messagebox.showerror("Importação", str(exc), parent=self)
-            return
-        self._data_changed()
-        messagebox.showinfo("Importação concluída", "Os dados foram importados com sucesso.", parent=self)
-        self.show_library()
-
-    def export_full_backup(self):
-        path = filedialog.asksaveasfilename(
-            defaultextension=".zip",
-            filetypes=[("Backup ZIP", "*.zip")],
-            initialfile="the-reader-codex-backup.zip",
-        )
-        if not path:
-            return
-        try:
-            result = self.backup_service.export_full_backup(path)
-        except Exception as exc:
-            messagebox.showerror("Backup", str(exc), parent=self)
-            return
-        messagebox.showinfo("Backup concluído", f"Backup completo criado em:\n{result}", parent=self)
-
-    def import_full_backup(self):
-        path = filedialog.askopenfilename(filetypes=[("Backup ZIP", "*.zip")])
-        if not path:
-            return
-        if not messagebox.askyesno("Restaurar backup", "A restauração substituirá os dados locais atuais. Continuar?", parent=self):
-            return
-        try:
-            self.backup_service.create_automatic_backup()
-            self.backup_service.import_full_backup(path)
-        except Exception as exc:
-            messagebox.showerror("Restauração", str(exc), parent=self)
-            return
-        self._data_changed()
-        messagebox.showinfo("Restauração concluída", "Biblioteca e capas restauradas.", parent=self)
-        self.show_library()
-
-    def manual_backup(self):
-        try:
-            result = self.backup_service.create_automatic_backup()
-        except Exception as exc:
-            messagebox.showerror("Backup", str(exc), parent=self)
-            return
-        messagebox.showinfo("Backup criado", f"Backup completo:\n{result['zip']}", parent=self)
-
-    def _startup_backup(self):
-        try:
-            self.backup_service.create_automatic_backup()
-        except Exception as exc:
-            print(f"Falha ao criar backup automático: {exc}")
+        scroll, layout = self._make_scroll()
+        layout.addWidget(PageHeader("Backup", "Exporte uma cópia completa com capas ou restaure uma biblioteca.", "Segurança"))
+        panel = QFrame(); panel.setObjectName("panel"); pl = QVBoxLayout(panel); pl.setContentsMargins(18,16,18,16)
+        export = QPushButton("Exportar backup completo (.zip)"); export.setObjectName("primary"); export.setIcon(icon("backup", color="#17130A")); export.clicked.connect(self._export_backup); pl.addWidget(export)
+        import_btn = QPushButton("Restaurar backup completo"); import_btn.setIcon(icon("folder", color="#F4F2ED")); import_btn.clicked.connect(self._import_backup); pl.addWidget(import_btn)
+        json_export = QPushButton("Exportar metadados (.json)"); json_export.clicked.connect(self._export_json); pl.addWidget(json_export)
+        json_import = QPushButton("Importar metadados (.json)"); json_import.clicked.connect(self._import_json); pl.addWidget(json_import)
+        layout.addWidget(panel); layout.addStretch(); self._set_page(scroll, "backup")
 
     def show_settings(self):
-        self.current_view = "settings"
-        self._clear_content()
-        self._header("Configurações", "Configure a sincronização opcional com Google Sheets e Google Drive.")
-        settings = self.settings_service.load()
-        google = settings.get("google", {})
+        scroll, layout = self._make_scroll()
+        layout.addWidget(PageHeader("Configurações", "Comportamento local, sincronização Google e manutenção.", "Preferências"))
+        settings = self.settings_service.load(); google = settings["google"]
+        panel = QFrame(); panel.setObjectName("panel"); fg = QGridLayout(panel); fg.setContentsMargins(18,16,18,18); fg.setHorizontalSpacing(10); fg.setVerticalSpacing(8); fg.setColumnStretch(1,1)
+        sync = QCheckBox("Ativar sincronização Google"); sync.setChecked(settings["sync_enabled"]); fg.addWidget(sync,0,0,1,3)
+        fg.addWidget(QLabel("Pausar automaticamente após (dias sem progresso)"),1,0)
+        pause_days = NumericStepper(minimum=0, maximum=3650, value=settings.get("auto_pause_days",30), special_value_text="Desativado"); fg.addWidget(pause_days,1,1)
+        cred = QLineEdit(google.get("credentials_file","")); fg.addWidget(QLabel("Credenciais Google"),2,0); fg.addWidget(cred,2,1)
+        browse = QPushButton("Selecionar"); browse.clicked.connect(lambda: self._browse_credentials(cred)); fg.addWidget(browse,2,2)
+        sheet = QLineEdit(google.get("spreadsheet_name","The Reader Codex")); fg.addWidget(QLabel("Nome da planilha"),3,0); fg.addWidget(sheet,3,1,1,2)
+        sheet_id = QLineEdit(google.get("spreadsheet_id","")); fg.addWidget(QLabel("ID da planilha"),4,0); fg.addWidget(sheet_id,4,1,1,2)
+        folder = QLineEdit(google.get("drive_folder_id","")); fg.addWidget(QLabel("ID da pasta do Drive"),5,0); fg.addWidget(folder,5,1,1,2)
+        buttons = QHBoxLayout(); save = QPushButton("Salvar configurações"); save.setObjectName("primary"); test = QPushButton("Testar conexão"); sync_now = QPushButton("Sincronizar agora")
+        buttons.addStretch(); buttons.addWidget(test); buttons.addWidget(sync_now); buttons.addWidget(save); fg.addLayout(buttons,6,0,1,3)
+        def save_settings(notify=True):
+            payload={"sync_enabled":sync.isChecked(),"profile_name":settings.get("profile_name",""),"auto_pause_days":pause_days.value(),"google":{"credentials_file":cred.text().strip(),"spreadsheet_name":sheet.text().strip() or "The Reader Codex","spreadsheet_id":sheet_id.text().strip(),"drive_folder_id":folder.text().strip()}}
+            self.settings_service.save(payload); self._update_sync_status(); self._apply_inactivity_rule()
+            if notify: QMessageBox.information(self,"Configurações","Configurações salvas.")
+        save.clicked.connect(lambda: save_settings(True))
+        test.clicked.connect(lambda: (save_settings(False), self.test_google_connection()))
+        sync_now.clicked.connect(lambda: (save_settings(False), self.sync_in_background(True)))
+        layout.addWidget(panel)
+        data = QFrame(); data.setObjectName("panel"); dl=QHBoxLayout(data); dl.setContentsMargins(14,12,14,12); path=QLabel(f"Dados locais: {DATA_DIR}"); path.setObjectName("muted"); path.setWordWrap(True); dl.addWidget(path,1); open_btn=QPushButton("Abrir pasta"); open_btn.setIcon(icon("folder", color="#F4F2ED")); open_btn.clicked.connect(self.open_data_folder); dl.addWidget(open_btn); layout.addWidget(data)
+        pending=QLabel(f"Alterações locais aguardando sincronização: {self.repo.pending_sync_count()}"); pending.setObjectName("dim"); layout.addWidget(pending)
+        layout.addStretch(); self._set_page(scroll, "settings")
 
-        form = ctk.CTkFrame(self.content)
-        form.pack(fill="x", pady=(0, 16))
-        form.grid_columnconfigure(1, weight=1)
-        self.settings_sync_var = ctk.BooleanVar(value=bool(settings.get("sync_enabled")))
-        ctk.CTkCheckBox(
-            form,
-            text="Ativar sincronização Google",
-            variable=self.settings_sync_var,
-        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(14, 10))
+    def open_new_work(self):
+        self.previous_view = self.current_view if self.current_view not in ("work_form", "work_details") else "library"
+        page = WorkFormPage(self.repo)
+        page.saved.connect(self._work_saved)
+        page.cancelled.connect(self._return_previous)
+        self._set_page(page, "work_form")
 
-        def field(row, label, value, browse=False):
-            ctk.CTkLabel(form, text=label, anchor="w").grid(row=row, column=0, sticky="w", padx=12, pady=7)
-            entry = ctk.CTkEntry(form)
-            entry.insert(0, value or "")
-            entry.grid(row=row, column=1, sticky="ew", padx=8, pady=7)
-            if browse:
-                ctk.CTkButton(form, text="Selecionar", width=90, command=lambda: self._browse_credentials(entry)).grid(
-                    row=row, column=2, padx=(0, 12), pady=7
-                )
-            return entry
+    def open_details(self, work_id):
+        if not self.repo.get_by_id(work_id): return
+        self.previous_view = self.current_view if self.current_view not in ("work_form", "work_details") else self.previous_view
+        self.current_work_id = work_id
+        page = WorkDetailsPage(self.repo, work_id)
+        page.backRequested.connect(self._return_previous)
+        page.editRequested.connect(self.open_edit_work)
+        page.dataChanged.connect(self._data_changed)
+        self._set_page(page, "work_details")
 
-        self.settings_credentials = field(1, "credentials.json", google.get("credentials_file", ""), browse=True)
-        self.settings_sheet_name = field(2, "Nome da planilha", google.get("spreadsheet_name", "The Reader Codex"))
-        self.settings_sheet_id = field(3, "ID da planilha (opcional)", google.get("spreadsheet_id", ""))
-        self.settings_drive_folder = field(4, "ID da pasta do Drive (opcional)", google.get("drive_folder_id", ""))
+    def open_edit_work(self, work_id):
+        work = self.repo.get_by_id(work_id)
+        if not work: return
+        page = WorkFormPage(self.repo, work)
+        page.saved.connect(lambda wid: self._work_saved(wid, open_details=True))
+        page.cancelled.connect(lambda: self.open_details(work_id))
+        page.deleted.connect(lambda: (self._data_changed(), self.show_library()))
+        self._set_page(page, "work_form")
 
-        actions = ctk.CTkFrame(form, fg_color="transparent")
-        actions.grid(row=5, column=0, columnspan=3, sticky="e", padx=12, pady=(8, 14))
-        ctk.CTkButton(actions, text="Salvar configurações", command=self.save_settings).pack(side="left", padx=4)
-        ctk.CTkButton(actions, text="Testar conexão", command=self.test_google_connection).pack(side="left", padx=4)
-        ctk.CTkButton(actions, text="Sincronizar agora", command=lambda: self.sync_in_background(show_dialog=True)).pack(side="left", padx=4)
+    def _work_saved(self, work_id, open_details=False):
+        self._data_changed()
+        if open_details: self.open_details(work_id)
+        else: self.show_library()
 
-        pending = self.repo.pending_sync_count()
-        ctk.CTkLabel(
-            self.content,
-            text=f"Alterações locais aguardando sincronização: {pending}",
-            font=sans(14, "bold"),
-            anchor="w",
-        ).pack(fill="x", pady=(4, 8))
-        data_box = ctk.CTkFrame(self.content)
-        data_box.pack(fill="x", pady=(4, 12))
-        ctk.CTkLabel(
-            data_box,
-            text=f"Dados locais: {DATA_DIR}",
-            anchor="w",
-            justify="left",
-            wraplength=760,
-        ).pack(side="left", fill="x", expand=True, padx=12, pady=10)
-        ctk.CTkButton(
-            data_box,
-            text="Abrir pasta de dados",
-            width=150,
-            command=self.open_data_folder,
-        ).pack(side="right", padx=12, pady=10)
+    def _return_previous(self):
+        self.navigate(self.previous_view if self.previous_view in {x[0] for x in self.NAV} | {"settings","backup"} else "library")
 
-        ctk.CTkLabel(
-            self.content,
-            text=(
-                "A aplicação funciona normalmente sem Google. Para uso pessoal, prefira credenciais OAuth de aplicativo "
-                "Desktop: no primeiro teste o navegador abrirá para você autorizar a conta e o token ficará salvo apenas "
-                "neste computador. Também é possível usar uma conta de serviço; nesse caso, compartilhe a planilha e a "
-                "pasta/Shared Drive com o e-mail da conta de serviço. Se o ID da planilha ficar vazio, o sistema procura "
-                "pelo nome informado e tenta criar uma nova quando a credencial permitir."
-            ),
-            wraplength=860,
-            justify="left",
-            anchor="w",
-            text_color=("gray35", "gray70"),
-        ).pack(fill="x", pady=(4, 12))
+    def _toggle_favorite(self, work_id, favorite):
+        try: self.repo.set_favorite(work_id, favorite)
+        except Exception as exc: QMessageBox.critical(self,"Favorito",str(exc)); return
+        self._data_changed(); self._refresh_current()
 
-    def open_data_folder(self):
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        try:
-            if os.name == "nt":
-                os.startfile(str(DATA_DIR))
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(DATA_DIR)])
-            else:
-                subprocess.Popen(["xdg-open", str(DATA_DIR)])
-        except Exception as exc:
-            messagebox.showerror("Pasta de dados", f"Não foi possível abrir a pasta:\n{exc}", parent=self)
+    def _change_progress(self, work_id, amount):
+        try: self.repo.increment_progress(work_id, amount)
+        except Exception as exc: QMessageBox.critical(self,"Progresso",str(exc)); return
+        self._data_changed(); self._refresh_current()
 
-    def _browse_credentials(self, entry):
-        path = filedialog.askopenfilename(parent=self, filetypes=[("JSON", "*.json"), ("Todos os arquivos", "*.*")])
-        if path:
-            entry.delete(0, "end")
-            entry.insert(0, path)
+    def _open_reading_link(self, work_id):
+        work=self.repo.get_by_id(work_id)
+        if work and work.reading_url: QDesktopServices.openUrl(QUrl(work.reading_url))
 
-    def _collect_settings(self):
-        return {
-            "sync_enabled": bool(self.settings_sync_var.get()),
-            "profile_name": self.settings_service.load().get("profile_name", ""),
-            "google": {
-                "credentials_file": self.settings_credentials.get().strip(),
-                "spreadsheet_name": self.settings_sheet_name.get().strip() or "The Reader Codex",
-                "spreadsheet_id": self.settings_sheet_id.get().strip(),
-                "drive_folder_id": self.settings_drive_folder.get().strip(),
-            },
-        }
+    def _refresh_current(self):
+        view=self.current_view
+        if view=="work_details" and self.current_work_id: self.open_details(self.current_work_id)
+        elif view=="work_form": return
+        else: self.navigate(view)
 
-    def save_settings(self, notify=True, schedule_sync=True):
-        if not hasattr(self, "settings_sync_var"):
-            return
-        self.settings_service.save(self._collect_settings())
-        self._update_sync_label_from_status()
-        self._schedule_periodic_sync()
-        if schedule_sync and self.sync_engine.status().get("status") == "ready":
-            if self._sync_debounce_job is not None:
-                try:
-                    self.after_cancel(self._sync_debounce_job)
-                except Exception:
-                    pass
-            self._sync_debounce_job = self.after(1000, self._run_debounced_sync)
-        if notify:
-            messagebox.showinfo("Configurações", "Configurações salvas.", parent=self)
-
-    def test_google_connection(self):
-        self.save_settings(notify=False, schedule_sync=False)
-        self.sync_label.configure(text="☁ Testando conexão...")
-
-        def worker():
-            try:
-                info = self.sync_engine.test_connection()
-                result = {"ok": True, "info": info}
-            except Exception as exc:
-                result = {"ok": False, "message": str(exc)}
-            self.after(0, lambda: self._apply_connection_test(result))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _apply_connection_test(self, result):
-        self._update_sync_label_from_status()
-        if result["ok"]:
-            if self.current_view == "settings":
-                self.show_settings()
-            messagebox.showinfo(
-                "Google",
-                f"Conexão realizada. Planilha: {result['info'].get('spreadsheet_name', 'The Reader Codex')}",
-                parent=self,
-            )
-        else:
-            messagebox.showerror("Google", result["message"], parent=self)
-
-    def _update_sync_label_from_status(self):
-        result = self.sync_engine.status()
-        pending = result.get("pending", 0)
-        if result["status"] == "not_configured":
-            self.sync_label.configure(text=f"○ Nuvem não configurada\n{pending} alteração(ões) local(is)")
-        else:
-            self.sync_label.configure(text=f"☁ Google configurado\n{pending} alteração(ões) pendente(s)")
+    def _global_search(self):
+        self.library_filters["search"] = self.global_search.text().strip(); self.show_library()
 
     def _data_changed(self):
-        """Refresh sync state and debounce cloud upload after a local mutation."""
-        self._update_sync_label_from_status()
-        if self.sync_engine.status().get("status") != "ready":
-            return
-        if self._sync_debounce_job is not None:
-            try:
-                self.after_cancel(self._sync_debounce_job)
-            except Exception:
-                pass
-        self._sync_debounce_job = self.after(3000, self._run_debounced_sync)
-
-    def _run_debounced_sync(self):
-        self._sync_debounce_job = None
-        self.sync_in_background(show_dialog=False)
-
-    def _schedule_periodic_sync(self):
-        if self._periodic_sync_job is not None:
-            try:
-                self.after_cancel(self._periodic_sync_job)
-            except Exception:
-                pass
-        self._periodic_sync_job = self.after(300000, self._periodic_sync)
-
-    def _periodic_sync(self):
-        self._periodic_sync_job = None
+        self._update_sync_status()
         if self.sync_engine.status().get("status") == "ready":
-            self.sync_in_background(show_dialog=False)
-        self._schedule_periodic_sync()
+            QTimer.singleShot(2500, lambda: self.sync_in_background(False))
+
+    def _apply_inactivity_rule(self):
+        days=self.settings_service.load().get("auto_pause_days",30)
+        changed=self.repo.apply_inactivity_rules(days)
+        if changed and hasattr(self,"stack"): self._update_sync_status()
+
+    def _startup_backup(self):
+        try: self.backup_service.create_automatic_backup()
+        except Exception: pass
+
+    def _export_backup(self):
+        path,_=QFileDialog.getSaveFileName(self,"Exportar backup","TheReaderCodex-backup.zip","ZIP (*.zip)")
+        if path:
+            try: self.backup_service.export_full_backup(path); QMessageBox.information(self,"Backup","Backup completo exportado.")
+            except Exception as exc: QMessageBox.critical(self,"Backup",str(exc))
+
+    def _import_backup(self):
+        path,_=QFileDialog.getOpenFileName(self,"Restaurar backup","","ZIP (*.zip)")
+        if not path:return
+        if QMessageBox.question(self,"Restaurar backup","A biblioteca atual será substituída. Continuar?",QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)!=QMessageBox.StandardButton.Yes:return
+        try: self.backup_service.create_automatic_backup(); self.backup_service.import_full_backup(path); self._data_changed(); self.show_library(); QMessageBox.information(self,"Backup","Backup restaurado.")
+        except Exception as exc: QMessageBox.critical(self,"Backup",str(exc))
+
+    def _export_json(self):
+        path,_=QFileDialog.getSaveFileName(self,"Exportar JSON","TheReaderCodex.json","JSON (*.json)")
+        if path:
+            try:self.backup_service.export_json(path); QMessageBox.information(self,"Backup","JSON exportado.")
+            except Exception as exc:QMessageBox.critical(self,"Backup",str(exc))
+
+    def _import_json(self):
+        path,_=QFileDialog.getOpenFileName(self,"Importar JSON","","JSON (*.json)")
+        if not path:return
+        if QMessageBox.question(self,"Importar JSON","A biblioteca atual será substituída. Continuar?",QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)!=QMessageBox.StandardButton.Yes:return
+        try:self.backup_service.create_automatic_backup(); self.backup_service.import_json(path); self._data_changed(); self.show_library(); QMessageBox.information(self,"Backup","JSON importado.")
+        except Exception as exc:QMessageBox.critical(self,"Backup",str(exc))
+
+    def _browse_credentials(self, entry):
+        path,_=QFileDialog.getOpenFileName(self,"Credenciais Google","","JSON (*.json)")
+        if path: entry.setText(path)
+
+    def open_data_folder(self):
+        DATA_DIR.mkdir(parents=True,exist_ok=True); QDesktopServices.openUrl(QUrl.fromLocalFile(str(DATA_DIR)))
+
+    def _update_sync_status(self):
+        status=self.sync_engine.status(); pending=status.get("pending",0)
+        if status.get("status")=="ready": self.sync_label.setText(f"Google configurado\n{pending} alteração(ões) pendente(s)")
+        else: self.sync_label.setText(f"Nuvem não configurada\n{pending} alteração(ões) local(is)")
 
     def sync_in_background(self, show_dialog=False):
-        if self._sync_running:
-            if show_dialog:
-                messagebox.showinfo("Sincronização", "Uma sincronização já está em andamento.", parent=self)
+        if self._sync_running:return
+        if self.sync_engine.status().get("status")!="ready":
+            self._update_sync_status()
+            if show_dialog: QMessageBox.information(self,"Sincronização","Configure o Google em Configurações.")
             return
-        status = self.sync_engine.status()
-        if status["status"] == "not_configured":
-            self._update_sync_label_from_status()
-            if show_dialog:
-                messagebox.showinfo(
-                    "Sincronização",
-                    "A sincronização Google não está configurada. Use Configurações para ativá-la.",
-                    parent=self,
-                )
-            return
-        self._sync_running = True
-        self.sync_button.configure(state="disabled")
-        self.sync_label.configure(text="☁ Sincronizando...")
+        self._sync_running=True; self.sync_button.setEnabled(False); self.sync_label.setText("Sincronizando...")
+        def worker(): self.syncFinished.emit(self.sync_engine.sync(), show_dialog)
+        threading.Thread(target=worker,daemon=True).start()
 
+    def _apply_sync_result(self, result, show_dialog):
+        self._sync_running=False; self.sync_button.setEnabled(True); self._update_sync_status()
+        if result.get("status")=="synced":
+            if result.get("downloaded"): self._refresh_current()
+            if show_dialog: QMessageBox.information(self,"Sincronização",f"Concluída.\nEnviadas: {result.get('uploaded',0)}\nRecebidas: {result.get('downloaded',0)}")
+        elif show_dialog: QMessageBox.critical(self,"Sincronização",result.get("message","Falha na sincronização."))
+
+    def test_google_connection(self):
         def worker():
-            result = self.sync_engine.sync()
-            self.after(0, lambda: self._apply_sync_result(result, show_dialog))
+            try:self.connectionFinished.emit({"ok":True,"info":self.sync_engine.test_connection()})
+            except Exception as exc:self.connectionFinished.emit({"ok":False,"message":str(exc)})
+        threading.Thread(target=worker,daemon=True).start()
 
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _apply_sync_result(self, result, show_dialog=False):
-        self._sync_running = False
-        self.sync_button.configure(state="normal")
-        status = result.get("status")
-        if status == "synced":
-            self.sync_label.configure(text="☁ Sincronizado\n0 alterações pendentes")
-            if result.get("downloaded"):
-                self.refresh_current_view()
-            if show_dialog:
-                messagebox.showinfo(
-                    "Sincronização concluída",
-                    f"Alterações locais processadas: {result.get('uploaded', 0)}\n"
-                    f"Registros recebidos/atualizados: {result.get('downloaded', 0)}\n"
-                    f"Capas enviadas: {result.get('covers_uploaded', 0)}\n"
-                    f"Capas baixadas: {result.get('covers_downloaded', 0)}",
-                    parent=self,
-                )
-            return
-        pending = result.get("pending", self.repo.pending_sync_count())
-        if status == "not_configured":
-            self.sync_label.configure(text=f"○ Nuvem não configurada\n{pending} alteração(ões) local(is)")
-        else:
-            self.sync_label.configure(text=f"⚠ Falha na sincronização\n{pending} alteração(ões) protegida(s) localmente")
-            if show_dialog:
-                messagebox.showerror("Sincronização", result.get("message", "Falha desconhecida."), parent=self)
+    def _apply_connection_result(self, result):
+        self._update_sync_status()
+        if result.get("ok"): QMessageBox.information(self,"Google",f"Conexão realizada. Planilha: {result['info'].get('spreadsheet_name','The Reader Codex')}")
+        else: QMessageBox.critical(self,"Google",result.get("message","Falha na conexão."))

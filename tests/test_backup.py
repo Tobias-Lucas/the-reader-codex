@@ -22,6 +22,8 @@ class BackupServiceTests(unittest.TestCase):
                 progress_total=200,
                 rating=4.5,
                 favorite=True,
+                reading_url="https://example.com/ler",
+                publication_status="Completo",
             )
             source_repo.set_tags(work.id, ["fantasia", "teste"])
             source_image = root / "cover.png"
@@ -41,6 +43,8 @@ class BackupServiceTests(unittest.TestCase):
             self.assertEqual(restored.name, "Livro com capa")
             self.assertEqual(restored.rating, 4.5)
             self.assertTrue(restored.favorite)
+            self.assertEqual(restored.publication_status, "Completo")
+            self.assertEqual(restored.reading_url, "https://example.com/ler")
             self.assertEqual(target_repo.get_tags(restored.id), ["fantasia", "teste"])
             self.assertTrue(Path(restored.cover_path).is_file())
             self.assertEqual(Path(restored.cover_path).parent, (root / "target-covers").resolve())
@@ -84,6 +88,22 @@ class BackupServiceTests(unittest.TestCase):
             target_service.import_json(json_path)
             self.assertEqual(target.list_all()[0].name, "A")
             self.assertEqual(target.list_all()[0].rating, 3.5)
+
+    def test_category_progress_unit_survives_json_backup(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = SQLiteWorkRepository(root / "a.db", root / "covers-a")
+            repo.create_category("Manhwa", "Capítulo")
+            service = BackupService(repo, root / "a.db", root / "backups")
+            json_path = root / "export.json"
+            service.export_json(json_path)
+
+            target = SQLiteWorkRepository(root / "b.db", root / "covers-b")
+            target_service = BackupService(target, root / "b.db", root / "backups-b")
+            target_service.import_json(json_path)
+            restored = target.get_category("Manhwa")
+            self.assertIsNotNone(restored)
+            self.assertEqual(restored["progress_unit"], "Capítulo")
 
 
 if __name__ == "__main__":

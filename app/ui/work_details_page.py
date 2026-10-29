@@ -1,270 +1,328 @@
+from __future__ import annotations
+
 from pathlib import Path
-from tkinter import messagebox
 
-import customtkinter as ctk
-from PIL import Image
-
-from app.ui.theme import (
-    AMBER, AMBER_BRIGHT, BLACK_TEXT, BORDER, GREEN, PURPLE_DARK, RED,
-    SURFACE, SURFACE_LOW, SURFACE_RAISED, TEXT, TEXT_DIM, TEXT_MUTED, sans,
+from PySide6.QtCore import Qt, Signal, QUrl
+from PySide6.QtGui import QDesktopServices, QPixmap
+from PySide6.QtWidgets import (
+    QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QMessageBox, QProgressBar,
+    QPushButton, QScrollArea, QTextEdit, QVBoxLayout, QWidget
 )
-from app.utils.dates import iso_to_br, next_release_label, normalize_weekday
+
+from app.ui.icons import icon
+from app.ui.widgets import PageHeader, TagChip
+from app.utils.dates import iso_to_br
+from app.utils.releases import release_description
 
 
-class WorkDetailsPage(ctk.CTkFrame):
-    STATUS_COLORS = {
-        "Lendo": AMBER, "Concluído": GREEN, "Quero ler": TEXT_MUTED,
-        "Pausado": "#C7A5FF", "Abandonado": RED,
-    }
+class WorkDetailsPage(QWidget):
+    backRequested = Signal()
+    editRequested = Signal(str)
+    dataChanged = Signal()
 
-    def __init__(self, master, repository, work_id, on_back, on_edit, on_changed):
-        super().__init__(master, fg_color="transparent")
+    def __init__(self, repository, work_id: str, parent=None):
+        super().__init__(parent)
         self.repository = repository
         self.work_id = work_id
-        self.on_back = on_back
-        self.on_edit = on_edit
-        self.on_changed = on_changed
-        self._cover_image = None
-        self.grid_columnconfigure(0, weight=1)
-        self.render()
+        self._build()
+        self.refresh()
 
-    def render(self):
-        for child in self.winfo_children():
-            child.destroy()
-        work = self.repository.get_by_id(self.work_id)
-        if work is None:
-            self.on_back()
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        root.addWidget(scroll)
+        self.page = QWidget()
+        scroll.setWidget(self.page)
+        self.layout = QVBoxLayout(self.page)
+        self.layout.setContentsMargins(28, 22, 28, 32)
+        self.layout.setSpacing(15)
+
+    def _clear(self):
+        while self.layout.count():
+            item = self.layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+            child_layout = item.layout()
+            if child_layout:
+                while child_layout.count():
+                    sub = child_layout.takeAt(0)
+                    if sub.widget():
+                        sub.widget().deleteLater()
+
+    def refresh(self):
+        self._clear()
+        self.work = self.repository.get_by_id(self.work_id)
+        if not self.work:
+            self.backRequested.emit()
             return
-        self.work = work
-        self._render_nav()
-        self._render_hero()
-        self._render_progress()
-        self._render_content()
+        release_state = self.repository.get_release_state(self.work_id)
 
-    def _render_nav(self):
-        nav = ctk.CTkFrame(self, fg_color="transparent")
-        nav.grid(row=0, column=0, sticky="ew", padx=6, pady=(4, 10))
-        ctk.CTkButton(
-            nav, text="← Biblioteca", command=self.on_back, width=105, height=34,
-            fg_color="transparent", hover_color=SURFACE_RAISED, border_width=1,
-            border_color=BORDER, text_color=TEXT_MUTED, font=sans(12, "bold"),
-        ).pack(side="left")
-        ctk.CTkButton(
-            nav, text="Editar cadastro", command=lambda: self.on_edit(self.work_id), width=120, height=34,
-            fg_color=SURFACE_RAISED, hover_color=BORDER, border_width=1,
-            border_color=BORDER, text_color=TEXT, font=sans(12, "bold"),
-        ).pack(side="right")
+        nav = QHBoxLayout()
+        back = QPushButton("Voltar")
+        back.setObjectName("ghost")
+        back.setIcon(icon("arrow-left", color="#F4EFEA"))
+        back.clicked.connect(self.backRequested)
+        nav.addWidget(back)
+        nav.addStretch()
+        self.layout.addLayout(nav)
 
-    def _render_hero(self):
-        work = self.work
-        hero = ctk.CTkFrame(self, fg_color=SURFACE, border_width=1, border_color=BORDER, corner_radius=16)
-        hero.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 12))
-        hero.grid_columnconfigure(1, weight=1)
+        hero = QFrame()
+        hero.setObjectName("panel")
+        h = QGridLayout(hero)
+        h.setContentsMargins(22, 22, 22, 22)
+        h.setHorizontalSpacing(20)
+        h.setVerticalSpacing(9)
+        h.setColumnStretch(1, 1)
 
-        cover = ctk.CTkFrame(hero, width=220, height=310, fg_color="#0B0A10", border_width=1, border_color=BORDER, corner_radius=10)
-        cover.grid(row=0, column=0, rowspan=7, padx=22, pady=22, sticky="n")
-        cover.grid_propagate(False)
-        label = ctk.CTkLabel(cover, text="CAPA\nINDISPONÍVEL", font=sans(11, "bold"), text_color=TEXT_DIM)
-        label.place(relx=0.5, rely=0.5, anchor="center")
-        if work.cover_path:
-            try:
-                path = Path(work.cover_path)
-                if path.is_file():
-                    with Image.open(path) as image:
-                        image = image.convert("RGB")
-                        image.thumbnail((210, 300))
-                        rendered = image.copy()
-                    self._cover_image = ctk.CTkImage(light_image=rendered, dark_image=rendered, size=rendered.size)
-                    label.configure(image=self._cover_image, text="")
-            except Exception:
-                pass
+        cover = QLabel("CAPA")
+        cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cover.setFixedSize(230, 322)
+        cover.setStyleSheet("background:#0F1012; border:1px solid #2B2E34; border-radius:4px; color:#756E64; font-weight:650;")
+        if self.work.cover_path and Path(self.work.cover_path).is_file():
+            pix = QPixmap(self.work.cover_path)
+            if not pix.isNull():
+                cover.setPixmap(pix.scaled(224, 316, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        h.addWidget(cover, 0, 0, 8, 1, Qt.AlignmentFlag.AlignTop)
 
-        top = ctk.CTkFrame(hero, fg_color="transparent")
-        top.grid(row=0, column=1, sticky="ew", padx=(0, 22), pady=(24, 0))
-        top.grid_columnconfigure(0, weight=1)
-        status_color = self.STATUS_COLORS.get(work.status, TEXT_MUTED)
-        ctk.CTkLabel(
-            top, text=f"  {work.status.upper()}  ", fg_color=status_color,
-            text_color=BLACK_TEXT if status_color in (AMBER, GREEN) else TEXT,
-            corner_radius=10, height=26, font=sans(10, "bold"),
-        ).grid(row=0, column=0, sticky="w")
-        ctk.CTkButton(
-            top, text="★" if work.favorite else "☆", width=42, height=34,
-            command=self._toggle_favorite, fg_color=SURFACE_RAISED, hover_color=BORDER,
-            border_width=1, border_color=BORDER, text_color=AMBER if work.favorite else TEXT_MUTED,
-            font=sans(18, "bold"),
-        ).grid(row=0, column=1, sticky="e")
+        title_row = QHBoxLayout()
+        title = QLabel(self.work.name)
+        title.setObjectName("pageTitle")
+        title.setWordWrap(True)
+        title_row.addWidget(title)
+        pub = QLabel(self.work.publication_status)
+        pub.setObjectName("publicationStatus")
+        title_row.addWidget(pub, 0, Qt.AlignmentFlag.AlignVCenter)
+        title_row.addStretch()
+        fav = QPushButton()
+        fav.setObjectName("favorite")
+        fav.setIcon(icon("star-filled" if self.work.favorite else "star"))
+        fav.setToolTip("Remover dos favoritos" if self.work.favorite else "Adicionar aos favoritos")
+        fav.clicked.connect(self._toggle_favorite)
+        title_row.addWidget(fav)
+        h.addLayout(title_row, 0, 1)
 
-        ctk.CTkLabel(hero, text=work.name, font=sans(31, "bold"), text_color=TEXT, anchor="w", wraplength=720, justify="left").grid(
-            row=1, column=1, sticky="ew", padx=(0, 22), pady=(12, 5)
-        )
+        chips = QHBoxLayout()
+        chips.addWidget(TagChip(self.work.status, accent=self.work.status == "Lendo"))
+        if self.work.category:
+            chip = TagChip(self.work.category.upper())
+            chip.setStyleSheet("padding:4px 9px; border-radius:10px; font-size:10px; font-weight:650; background:#2A2045; color:#C8B8FF;")
+            chips.addWidget(chip)
+        for tag in self.repository.get_tags(self.work_id)[:5]:
+            chips.addWidget(TagChip(tag))
+        chips.addStretch()
+        h.addLayout(chips, 1, 1)
+
+        rating = QLabel(self._rating_text())
+        rating.setObjectName("rating" if self.work.rating is not None else "dim")
+        h.addWidget(rating, 2, 1)
+
+        progress_box = QFrame()
+        progress_box.setObjectName("subPanel")
+        pg = QHBoxLayout(progress_box)
+        pg.setContentsMargins(17, 15, 17, 15)
+        left = QVBoxLayout()
+        caption = QLabel("ÚLTIMO CAPÍTULO LIDO" if self.work.progress_unit == "Capítulo" else "ÚLTIMA PÁGINA LIDA")
+        caption.setObjectName("progressCaption")
+        left.addWidget(caption)
+        valrow = QHBoxLayout()
+        val = QLabel(str(self.work.progress_current))
+        val.setObjectName("progressValue")
+        valrow.addWidget(val)
+        if self.work.progress_total:
+            suffix = QLabel(f"de {self.work.progress_total}")
+            suffix.setObjectName("progressUnit")
+            valrow.addWidget(suffix, 0, Qt.AlignmentFlag.AlignBottom)
+        valrow.addStretch()
+        left.addLayout(valrow)
+        pg.addLayout(left, 1)
+        right = QVBoxLayout()
+        right.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        pending = int(release_state.get("pending_count") or 0)
+        if pending:
+            label = QLabel("1 capítulo pendente" if pending == 1 else f"{pending} capítulos pendentes")
+            label.setObjectName("pending")
+            label.setAlignment(Qt.AlignmentFlag.AlignRight)
+            right.addWidget(label)
+            if release_state.get("oldest_pending"):
+                sub = QLabel(f"Pendente desde {iso_to_br(release_state['oldest_pending'])}")
+                sub.setObjectName("dim")
+                sub.setAlignment(Qt.AlignmentFlag.AlignRight)
+                right.addWidget(sub)
+        elif self.work.publication_status == "Em lançamento" and release_state.get("next_release"):
+            sub = QLabel(f"Próximo lançamento: {iso_to_br(release_state['next_release'])}")
+            sub.setObjectName("muted")
+            sub.setAlignment(Qt.AlignmentFlag.AlignRight)
+            right.addWidget(sub)
+        pg.addLayout(right)
+        h.addWidget(progress_box, 3, 1)
+
+        actions = QHBoxLayout()
+        for amount in (-1, 1, 5, 10):
+            btn = QPushButton(str(amount) if amount < 0 else f"+{amount}")
+            btn.setFixedWidth(52)
+            btn.clicked.connect(lambda _=False, a=amount: self._progress(a))
+            actions.addWidget(btn)
+        read = QPushButton("Ler")
+        read.setIcon(icon("external", color="#17130A"))
+        read.setObjectName("primary")
+        read.setEnabled(bool(self.work.reading_url))
+        read.clicked.connect(self._open_reading_url)
+        actions.addWidget(read)
+        edit = QPushButton("Editar cadastro")
+        edit.setIcon(icon("edit", color="#F4EFEA"))
+        edit.clicked.connect(lambda: self.editRequested.emit(self.work_id))
+        actions.addWidget(edit)
+        if self.work.publication_status == "Em lançamento":
+            hiatus = QPushButton("Colocar em hiato")
+            hiatus.setIcon(icon("pause", color="#F4EFEA"))
+            hiatus.clicked.connect(lambda: self._publication_status("Em hiato"))
+            actions.addWidget(hiatus)
+        elif self.work.publication_status == "Em hiato":
+            resume = QPushButton("Retomar lançamento")
+            resume.setIcon(icon("sync", color="#F4EFEA"))
+            resume.clicked.connect(lambda: self._publication_status("Em lançamento"))
+            actions.addWidget(resume)
+        actions.addStretch()
+        h.addLayout(actions, 4, 1)
+
         meta = []
-        if work.category:
-            meta.append(work.category)
-        if work.start_date:
-            meta.append(f"Início: {iso_to_br(work.start_date)}")
-        if work.end_date:
-            meta.append(f"Conclusão: {iso_to_br(work.end_date)}")
-        ctk.CTkLabel(hero, text="  •  ".join(meta) or "Sem metadados adicionais", font=sans(12), text_color=TEXT_MUTED, anchor="w").grid(
-            row=2, column=1, sticky="ew", padx=(0, 22), pady=(0, 8)
-        )
+        if self.work.start_date:
+            meta.append(f"Início: {iso_to_br(self.work.start_date)}")
+        if self.work.end_date:
+            meta.append(f"Conclusão: {iso_to_br(self.work.end_date)}")
+        if self.work.publication_status in ("Em lançamento", "Em hiato"):
+            meta.append(release_description(self.work.release_schedule_type, self.work.release_days, self.work.release_month_day))
+        meta_label = QLabel("  •  ".join(meta))
+        meta_label.setObjectName("dim")
+        meta_label.setWordWrap(True)
+        h.addWidget(meta_label, 5, 1)
+        self.layout.addWidget(hero)
 
-        chips = ctk.CTkFrame(hero, fg_color="transparent")
-        chips.grid(row=3, column=1, sticky="w", padx=(0, 22), pady=(0, 9))
-        if work.category:
-            self._chip(chips, work.category.upper(), AMBER).pack(side="left", padx=(0, 6))
-        for tag in self.repository.get_tags(work.id)[:6]:
-            self._chip(chips, tag, PURPLE_DARK).pack(side="left", padx=(0, 6))
+        if self.work.progress_total:
+            bar_panel = QFrame()
+            bar_panel.setObjectName("panel")
+            bl = QVBoxLayout(bar_panel)
+            bl.setContentsMargins(20, 16, 20, 16)
+            ratio = min(self.work.progress_current / self.work.progress_total, 1)
+            top = QHBoxLayout()
+            t = QLabel("Progresso total")
+            t.setObjectName("sectionTitle")
+            top.addWidget(t)
+            top.addStretch()
+            pct = QLabel(f"{ratio*100:.1f}%".replace(".", ","))
+            pct.setObjectName("pending")
+            top.addWidget(pct)
+            bl.addLayout(top)
+            bar = QProgressBar()
+            bar.setRange(0, 1000)
+            bar.setValue(int(ratio * 1000))
+            bl.addWidget(bar)
+            self.layout.addWidget(bar_panel)
 
-        rating_text, rating_color = self._rating_display(work.rating)
-        ctk.CTkLabel(hero, text=rating_text, font=sans(16, "bold"), text_color=rating_color, anchor="w").grid(
-            row=4, column=1, sticky="w", padx=(0, 22), pady=(4, 8)
-        )
+        edit_panel = QFrame()
+        edit_panel.setObjectName("panel")
+        ep = QGridLayout(edit_panel)
+        ep.setContentsMargins(20, 18, 20, 20)
+        ep.setHorizontalSpacing(16)
+        ep.setVerticalSpacing(8)
+        ep.setColumnStretch(1, 1)
+        title = QLabel("Atualização rápida")
+        title.setObjectName("sectionTitle")
+        ep.addWidget(title, 0, 0, 1, 2)
+        label = QLabel("STATUS DE LEITURA")
+        label.setObjectName("fieldLabel")
+        ep.addWidget(label, 1, 0)
+        self.status_combo = QComboBox()
+        self.status_combo.addItems(list(self.repository.STATUS_OPTIONS))
+        self.status_combo.setCurrentText(self.work.status)
+        ep.addWidget(self.status_combo, 2, 0)
+        status_save = QPushButton("Salvar status")
+        status_save.clicked.connect(self._save_status)
+        ep.addWidget(status_save, 3, 0, Qt.AlignmentFlag.AlignLeft)
 
-        pub_text = self._publication_text(work)
-        if pub_text:
-            ctk.CTkLabel(hero, text=pub_text, font=sans(12, "bold"), text_color=AMBER, anchor="w").grid(
-                row=5, column=1, sticky="w", padx=(0, 22), pady=(0, 10)
-            )
+        notes_label = QLabel("NOTAS PESSOAIS")
+        notes_label.setObjectName("fieldLabel")
+        ep.addWidget(notes_label, 1, 1)
+        self.notes = QTextEdit()
+        self.notes.setPlainText(self.work.personal_notes or "")
+        self.notes.setMinimumHeight(110)
+        ep.addWidget(self.notes, 2, 1)
+        notes_save = QPushButton("Salvar notas")
+        notes_save.clicked.connect(self._save_notes)
+        ep.addWidget(notes_save, 3, 1, Qt.AlignmentFlag.AlignRight)
+        self.layout.addWidget(edit_panel)
 
-    def _publication_text(self, work):
-        if work.progress_unit != "Capítulo" or work.progress_total is not None:
-            return ""
-        day = normalize_weekday(work.release_day)
-        if day:
-            prediction = next_release_label(day)
-            return f"Em lançamento • publicação: {day} • próximo: {prediction}"
-        return "Em lançamento • dia de publicação não informado"
+        synopsis = QFrame()
+        synopsis.setObjectName("panel")
+        sl = QVBoxLayout(synopsis)
+        sl.setContentsMargins(20, 18, 20, 20)
+        st = QLabel("Sinopse")
+        st.setObjectName("sectionTitle")
+        sl.addWidget(st)
+        text = QLabel(self.work.synopsis or "Nenhuma sinopse cadastrada.")
+        text.setWordWrap(True)
+        text.setObjectName("muted" if not self.work.synopsis else "")
+        sl.addWidget(text)
+        self.layout.addWidget(synopsis)
+        self.layout.addStretch()
 
-    def _render_progress(self):
-        work = self.work
-        panel = ctk.CTkFrame(self, fg_color=SURFACE, border_width=1, border_color=BORDER, corner_radius=14)
-        panel.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 12))
-        panel.grid_columnconfigure(0, weight=1)
-        total = work.progress_total or 0
-        ratio = min(work.progress_current / total, 1.0) if total else 0.0
-        if work.progress_unit == "Capítulo" and work.progress_total is None:
-            amount = f"Último capítulo lido: {work.progress_current}"
-            side = "Em lançamento"
-        elif work.progress_unit == "Página" and work.progress_total is None:
-            amount = f"Página atual: {work.progress_current}"
-            side = "Total não informado"
-        else:
-            plural = "páginas" if work.progress_unit == "Página" else "capítulos"
-            amount = f"{work.progress_current} de {work.progress_total} {plural}"
-            side = f"{ratio * 100:.1f}% concluído"
-        ctk.CTkLabel(panel, text="PROGRESSO DA LEITURA", font=sans(11, "bold"), text_color=TEXT_MUTED, anchor="w").grid(
-            row=0, column=0, sticky="w", padx=18, pady=(16, 4)
-        )
-        ctk.CTkLabel(panel, text=amount, font=sans(18, "bold"), text_color=TEXT, anchor="w").grid(
-            row=1, column=0, sticky="w", padx=18
-        )
-        ctk.CTkLabel(panel, text=side, font=sans(15, "bold"), text_color=AMBER).grid(
-            row=1, column=1, sticky="e", padx=18
-        )
-        bar = ctk.CTkProgressBar(panel, height=7, fg_color="#0B0A10", progress_color=AMBER)
-        bar.set(ratio)
-        bar.grid(row=2, column=0, columnspan=2, sticky="ew", padx=18, pady=(10, 10))
-        buttons = ctk.CTkFrame(panel, fg_color="transparent")
-        buttons.grid(row=3, column=0, columnspan=2, sticky="w", padx=18, pady=(0, 16))
-        for amount_delta in (-1, 1, 5, 10):
-            ctk.CTkButton(
-                buttons, text=str(amount_delta) if amount_delta < 0 else f"+{amount_delta}",
-                width=50, height=32, command=lambda a=amount_delta: self._increment(a),
-                fg_color=SURFACE_RAISED, hover_color=BORDER, border_width=1,
-                border_color=BORDER, text_color=TEXT,
-            ).pack(side="left", padx=(0, 6))
-
-    def _render_content(self):
-        work = self.work
-        grid = ctk.CTkFrame(self, fg_color="transparent")
-        grid.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 22))
-        grid.grid_columnconfigure(0, weight=3)
-        grid.grid_columnconfigure(1, weight=2)
-
-        synopsis = ctk.CTkFrame(grid, fg_color=SURFACE, border_width=1, border_color=BORDER, corner_radius=14)
-        synopsis.grid(row=0, column=0, sticky="nsew", padx=(0, 7))
-        ctk.CTkLabel(synopsis, text="SINOPSE", font=sans(11, "bold"), text_color=AMBER, anchor="w").pack(fill="x", padx=18, pady=(16, 6))
-        ctk.CTkLabel(
-            synopsis, text=work.synopsis or "Nenhuma sinopse cadastrada.", font=sans(13),
-            text_color=TEXT, justify="left", anchor="nw", wraplength=660,
-        ).pack(fill="both", expand=True, padx=18, pady=(0, 18))
-
-        quick = ctk.CTkFrame(grid, fg_color=SURFACE, border_width=1, border_color=BORDER, corner_radius=14)
-        quick.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
-        quick.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(quick, text="EDIÇÃO RÁPIDA", font=sans(11, "bold"), text_color=AMBER, anchor="w").grid(
-            row=0, column=0, sticky="ew", padx=16, pady=(16, 5)
-        )
-        ctk.CTkLabel(quick, text="Status da leitura", font=sans(10, "bold"), text_color=TEXT_MUTED, anchor="w").grid(
-            row=1, column=0, sticky="ew", padx=16, pady=(5, 4)
-        )
-        self.status_menu = ctk.CTkOptionMenu(quick, values=list(self.repository.STATUS_OPTIONS), height=38, font=sans(12), dropdown_font=sans(12))
-        self.status_menu.set(work.status)
-        self.status_menu.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
-        ctk.CTkLabel(quick, text="Notas pessoais", font=sans(10, "bold"), text_color=TEXT_MUTED, anchor="w").grid(
-            row=3, column=0, sticky="ew", padx=16, pady=(5, 4)
-        )
-        self.notes_text = ctk.CTkTextbox(quick, height=125, border_width=1, font=sans(12))
-        self.notes_text.grid(row=4, column=0, sticky="ew", padx=16, pady=(0, 10))
-        self.notes_text.insert("1.0", work.personal_notes or "")
-        ctk.CTkButton(
-            quick, text="Salvar status e notas", command=self._save_quick_edit,
-            height=38, fg_color=AMBER, hover_color=AMBER_BRIGHT,
-            text_color=BLACK_TEXT, font=sans(12, "bold"),
-        ).grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 16))
-
-    @staticmethod
-    def _chip(master, text, color):
-        return ctk.CTkLabel(
-            master, text=f"  {text}  ", height=24, corner_radius=12, fg_color=color,
-            text_color=BLACK_TEXT if color == AMBER else TEXT, font=sans(9, "bold"),
-        )
-
-    @staticmethod
-    def _rating_display(rating):
-        if rating is None:
-            return "☆☆☆☆☆  Sem avaliação", TEXT_DIM
-        value = float(rating)
+    def _rating_text(self):
+        if self.work.rating is None:
+            return "☆ Sem avaliação"
+        value = float(self.work.rating)
         full = int(value)
-        half = abs(value - full - 0.5) < 1e-9
-        remaining = 5 - full - (1 if half else 0)
-        stars = "★" * full + ("½" if half else "") + "☆" * max(remaining, 0)
-        return f"{stars}   {str(f'{value:.1f}').replace('.', ',')} / 5", AMBER
+        half = abs(value - full - .5) < 1e-9
+        stars = "★" * full + ("½" if half else "") + "☆" * max(0, 5 - full - (1 if half else 0))
+        return f"{stars}   {value:.1f} / 5".replace(".", ",")
 
-    def _update_work(self, **changes):
-        work = self.work
-        data = dict(
-            name=work.name, category=work.category, progress_unit=work.progress_unit,
-            progress_current=work.progress_current, progress_total=work.progress_total,
-            status=work.status, release_day=work.release_day, synopsis=work.synopsis,
-            rating=work.rating, favorite=work.favorite, personal_notes=work.personal_notes,
-            start_date=work.start_date, end_date=work.end_date,
-        )
-        data.update(changes)
-        self.repository.update_work(work.id, **data)
-        self.on_changed()
-        self.render()
+    def _progress(self, amount):
+        try:
+            self.repository.increment_progress(self.work_id, amount)
+        except Exception as exc:
+            QMessageBox.critical(self, "Progresso", str(exc))
+            return
+        self.dataChanged.emit()
+        self.refresh()
 
     def _toggle_favorite(self):
         try:
-            self._update_work(favorite=not self.work.favorite)
+            self.repository.set_favorite(self.work_id, not self.work.favorite)
         except Exception as exc:
-            messagebox.showerror("Favorito", str(exc), parent=self.winfo_toplevel())
+            QMessageBox.critical(self, "Favorito", str(exc))
+            return
+        self.dataChanged.emit()
+        self.refresh()
 
-    def _increment(self, amount):
+    def _save_status(self):
         try:
-            self.repository.increment_progress(self.work.id, amount)
-            self.on_changed()
-            self.render()
+            self.repository.set_reading_status(self.work_id, self.status_combo.currentText())
         except Exception as exc:
-            messagebox.showerror("Progresso", str(exc), parent=self.winfo_toplevel())
+            QMessageBox.critical(self, "Status", str(exc))
+            return
+        self.dataChanged.emit()
+        self.refresh()
 
-    def _save_quick_edit(self):
+    def _save_notes(self):
         try:
-            self._update_work(
-                status=self.status_menu.get(),
-                personal_notes=self.notes_text.get("1.0", "end").strip(),
-            )
+            self.repository.set_notes(self.work_id, self.notes.toPlainText().strip())
         except Exception as exc:
-            messagebox.showerror("Detalhes da obra", str(exc), parent=self.winfo_toplevel())
+            QMessageBox.critical(self, "Notas", str(exc))
+            return
+        self.dataChanged.emit()
+        QMessageBox.information(self, "Notas", "Notas pessoais salvas.")
+
+    def _publication_status(self, value):
+        try:
+            self.repository.set_publication_status(self.work_id, value)
+        except Exception as exc:
+            QMessageBox.critical(self, "Status da obra", str(exc))
+            return
+        self.dataChanged.emit()
+        self.refresh()
+
+    def _open_reading_url(self):
+        if self.work.reading_url:
+            QDesktopServices.openUrl(QUrl(self.work.reading_url))

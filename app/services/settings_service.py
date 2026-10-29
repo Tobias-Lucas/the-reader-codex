@@ -8,6 +8,7 @@ class SettingsService:
     DEFAULTS = {
         "sync_enabled": False,
         "profile_name": "",
+        "auto_pause_days": 30,
         "google": {
             "credentials_file": str(DEFAULT_CREDENTIALS_PATH),
             "spreadsheet_id": "",
@@ -30,9 +31,15 @@ class SettingsService:
                     data = loaded
             except (OSError, json.JSONDecodeError):
                 data = {}
+        try:
+            auto_pause_days = int(data.get("auto_pause_days", self.DEFAULTS["auto_pause_days"]))
+        except (TypeError, ValueError):
+            auto_pause_days = self.DEFAULTS["auto_pause_days"]
+        auto_pause_days = max(0, min(auto_pause_days, 3650))
         merged = {
             "sync_enabled": bool(data.get("sync_enabled", self.DEFAULTS["sync_enabled"])),
             "profile_name": str(data.get("profile_name", self.DEFAULTS["profile_name"])),
+            "auto_pause_days": auto_pause_days,
             "google": dict(self.DEFAULTS["google"]),
         }
         google = data.get("google") if isinstance(data.get("google"), dict) else {}
@@ -44,9 +51,14 @@ class SettingsService:
 
     def save(self, settings):
         google = settings.get("google") if isinstance(settings.get("google"), dict) else {}
+        try:
+            auto_pause_days = int(settings.get("auto_pause_days", self.DEFAULTS["auto_pause_days"]))
+        except (TypeError, ValueError):
+            auto_pause_days = self.DEFAULTS["auto_pause_days"]
         normalized = {
             "sync_enabled": bool(settings.get("sync_enabled", False)),
             "profile_name": str(settings.get("profile_name", "")).strip(),
+            "auto_pause_days": max(0, min(auto_pause_days, 3650)),
             "google": {
                 "credentials_file": str(google.get("credentials_file", "")).strip(),
                 "spreadsheet_id": str(google.get("spreadsheet_id", "")).strip(),

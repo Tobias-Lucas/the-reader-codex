@@ -3,19 +3,25 @@ import shutil
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 
 from app.models.work import Work
 from app.paths import COVERS_DIR, DB_PATH
-from app.utils.dates import next_weekday_date, normalize_weekday
+from app.utils.dates import normalize_weekday
+from app.utils.releases import (
+    PUBLICATION_STATUSES, SCHEDULE_TYPES, next_release_date, normalize_release_days,
+    release_dates_between, serialize_release_days,
+)
 
 
 class SQLiteWorkRepository:
     STATUS_OPTIONS = ("Quero ler", "Lendo", "Pausado", "Concluído", "Abandonado")
     PROGRESS_UNITS = ("Página", "Capítulo")
     GOAL_TYPES = ("books", "pages", "chapters")
-    SCHEMA_VERSION = 5
+    PUBLICATION_STATUS_OPTIONS = PUBLICATION_STATUSES
+    RELEASE_SCHEDULE_OPTIONS = SCHEDULE_TYPES
+    SCHEMA_VERSION = 7
 
     def __init__(self, db_path=None, covers_dir=None):
         self.db_path = str(Path(db_path or DB_PATH).resolve())
@@ -45,6 +51,7 @@ class SQLiteWorkRepository:
 
     def _create_schema(self):
         with self._connect() as conn:
+            previous_version = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS works (
                     id TEXT PRIMARY KEY,
@@ -54,7 +61,14 @@ class SQLiteWorkRepository:
                     progress_current INTEGER NOT NULL DEFAULT 0,
                     progress_total INTEGER,
                     status TEXT NOT NULL DEFAULT 'Quero ler',
+                    publication_status TEXT NOT NULL DEFAULT 'Completo',
                     release_day TEXT,
+                    release_schedule_type TEXT NOT NULL DEFAULT 'Sem calendário',
+                    release_days TEXT,
+                    release_month_day INTEGER,
+                    release_anchor_date TEXT,
+                    last_release_read_date TEXT,
+                    reading_url TEXT,
                     synopsis TEXT NOT NULL DEFAULT '',
                     rating REAL,
                     favorite INTEGER NOT NULL DEFAULT 0,
@@ -76,7 +90,8 @@ class SQLiteWorkRepository:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS categories (
                     name TEXT PRIMARY KEY COLLATE NOCASE,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    progress_unit TEXT NOT NULL DEFAULT 'Página'
                 )
             """)
 
@@ -133,6 +148,13 @@ class SQLiteWorkRepository:
                 ("cover_deleted", "INTEGER NOT NULL DEFAULT 0"),
                 ("deleted_at", "TEXT"),
                 ("sync_status", "TEXT NOT NULL DEFAULT 'PENDING_CREATE'"),
+                ("publication_status", "TEXT NOT NULL DEFAULT 'Completo'"),
+                ("release_schedule_type", "TEXT NOT NULL DEFAULT 'Sem calendário'"),
+                ("release_days", "TEXT"),
+                ("release_month_day", "INTEGER"),
+                ("release_anchor_date", "TEXT"),
+                ("last_release_read_date", "TEXT"),
+                ("reading_url", "TEXT"),
             ]:
                 self._ensure_column(conn, "works", column, definition)
 
@@ -141,6 +163,7 @@ class SQLiteWorkRepository:
                 ("updated_at", "TEXT"),
                 ("deleted_at", "TEXT"),
                 ("sync_status", "TEXT NOT NULL DEFAULT 'PENDING_CREATE'"),
+                ("progress_unit", "TEXT NOT NULL DEFAULT 'Página'"),
             ]:
                 self._ensure_column(conn, "categories", column, definition)
 
@@ -174,13 +197,51 @@ class SQLiteWorkRepository:
 
             # Any category already present in an older database becomes manageable.
             conn.execute("""
-                INSERT OR IGNORE INTO categories (name, created_at, id, updated_at, sync_status)
-                SELECT DISTINCT TRIM(category), ?, lower(hex(randomblob(16))), ?, 'PENDING_CREATE'
+                INSERT OR IGNORE INTO categories (name, created_at, id, updated_at, sync_status, progress_unit)
+                SELECT TRIM(category), ?, lower(hex(randomblob(16))), ?, 'PENDING_CREATE',
+                    COALESCE(MAX(CASE WHEN progress_unit = 'Capítulo' THEN 'Capítulo' END), 'Página')
                 FROM works
                 WHERE deleted_at IS NULL AND TRIM(category) <> ''
+                GROUP BY TRIM(category)
             """, (now, now))
 
-            conn.execute("PRAGMA user_version = 5")
+            # Migrate the legacy single weekday into the richer schedule model once.
+            if previous_version < 6:
+                conn.execute("""
+                    UPDATE works
+                    SET publication_status = CASE
+                        WHEN progress_unit = 'Capítulo' AND progress_total IS NULL THEN 'Em lançamento'
+                        ELSE 'Completo'
+                    END
+                """)
+                conn.execute("""
+                    UPDATE works
+                    SET release_schedule_type = 'Semanal',
+                        release_days = release_day
+                    WHERE release_day IS NOT NULL AND TRIM(release_day) <> ''
+                """)
+                conn.execute("""
+                    UPDATE works
+                    SET last_release_read_date = COALESCE(last_release_read_date, substr(updated_at, 1, 10))
+                    WHERE progress_unit = 'Capítulo' AND last_release_read_date IS NULL
+                """)
+            if previous_version < 7:
+                conn.execute("""
+                    UPDATE categories
+                    SET progress_unit = COALESCE(NULLIF(progress_unit, ''), 'Página')
+                """)
+                conn.execute("""
+                    UPDATE categories
+                    SET progress_unit = 'Capítulo'
+                    WHERE name IN (
+                        SELECT category
+                        FROM works
+                        WHERE deleted_at IS NULL AND progress_unit = 'Capítulo' AND TRIM(category) <> ''
+                        GROUP BY category
+                        HAVING SUM(CASE WHEN progress_unit = 'Página' THEN 1 ELSE 0 END) = 0
+                    )
+                """)
+            conn.execute("PRAGMA user_version = 7")
 
     @staticmethod
     def _ensure_column(conn, table, column, definition):
@@ -297,10 +358,60 @@ class SQLiteWorkRepository:
             raise ValueError(f"{field_name} deve estar no formato AAAA-MM-DD.") from exc
         return value
 
+    @classmethod
+    def _validate_publication_status(cls, value, progress_unit="Página", progress_total=None):
+        value = cls._normalize_text(value)
+        if not value:
+            if progress_unit == "Capítulo" and progress_total is None:
+                return "Em lançamento"
+            return "Completo"
+        if value not in cls.PUBLICATION_STATUS_OPTIONS:
+            raise ValueError("Status da obra inválido.")
+        return value
+
+    @classmethod
+    def _normalize_release_schedule(cls, schedule_type, release_days=None, release_month_day=None, release_anchor_date=None, legacy_release_day=None):
+        schedule_type = cls._normalize_text(schedule_type) or ("Semanal" if legacy_release_day else "Sem calendário")
+        if schedule_type not in cls.RELEASE_SCHEDULE_OPTIONS:
+            raise ValueError("Tipo de lançamento inválido.")
+        days = serialize_release_days(release_days or legacy_release_day)
+        if schedule_type == "Semanal" and not days:
+            raise ValueError("Selecione ao menos um dia da semana para o lançamento semanal.")
+        month_day = None
+        if schedule_type == "Mensal":
+            try:
+                month_day = int(release_month_day or 0)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Informe o dia do mês entre 1 e 31.") from exc
+            if month_day < 1 or month_day > 31:
+                raise ValueError("Informe o dia do mês entre 1 e 31.")
+        anchor = cls._validate_iso_date(release_anchor_date, "Data de referência")
+        if schedule_type == "Quinzenal" and not anchor:
+            raise ValueError("Informe uma data de referência para o lançamento quinzenal.")
+        if schedule_type not in ("Semanal",):
+            days = ""
+        if schedule_type != "Mensal":
+            month_day = None
+        if schedule_type != "Quinzenal":
+            anchor = None
+        legacy = normalize_weekday((days.split(",")[0] if days else legacy_release_day)) if schedule_type == "Semanal" else None
+        return schedule_type, days or None, month_day, anchor, legacy
+
+    @staticmethod
+    def _validate_reading_url(value):
+        from urllib.parse import urlparse
+        value = (value or "").strip()
+        if not value:
+            return None
+        parsed = urlparse(value)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError("O link de leitura deve começar com http:// ou https://.")
+        return value
+
     def list_all(self):
         return self.list_filtered()
 
-    def list_filtered(self, search="", category=None, status=None, tag=None, favorites_only=False):
+    def list_filtered(self, search="", category=None, status=None, tag=None, favorites_only=False, publication_status=None):
         where = ["w.deleted_at IS NULL"]
         params = []
         search = self._normalize_text(search)
@@ -314,13 +425,14 @@ class SQLiteWorkRepository:
                 (w.name LIKE ? COLLATE NOCASE OR
                  w.category LIKE ? COLLATE NOCASE OR
                  w.status LIKE ? COLLATE NOCASE OR
+                 w.publication_status LIKE ? COLLATE NOCASE OR
                  w.synopsis LIKE ? COLLATE NOCASE OR
                  w.personal_notes LIKE ? COLLATE NOCASE OR
                  EXISTS (SELECT 1 FROM work_tags wt_search
                          WHERE wt_search.work_id = w.id
                            AND wt_search.tag LIKE ? COLLATE NOCASE))
             """)
-            params.extend([term] * 6)
+            params.extend([term] * 7)
         if category and category != "Todas":
             where.append("w.category = ? COLLATE NOCASE")
             params.append(category)
@@ -336,14 +448,14 @@ class SQLiteWorkRepository:
             params.append(tag)
         if favorites_only:
             where.append("w.favorite = 1")
+        publication_status = self._normalize_text(publication_status)
+        if publication_status and publication_status != "Todos":
+            where.append("w.publication_status = ? COLLATE NOCASE")
+            params.append(publication_status)
 
         with self._connect() as conn:
             rows = conn.execute(f"""
-                SELECT w.id, w.name, w.category, w.progress_unit,
-                       w.progress_current, w.progress_total, w.status,
-                       w.release_day, w.synopsis, w.rating, w.favorite,
-                       w.personal_notes, w.start_date, w.end_date, w.cover_path,
-                       w.created_at, w.updated_at
+                SELECT w.*
                 FROM works w
                 WHERE {' AND '.join(where)}
                 ORDER BY w.favorite DESC, w.updated_at DESC
@@ -352,17 +464,13 @@ class SQLiteWorkRepository:
 
     def get_by_id(self, work_id):
         with self._connect() as conn:
-            row = conn.execute("""
-                SELECT id, name, category, progress_unit, progress_current,
-                       progress_total, status, release_day, synopsis, rating,
-                       favorite, personal_notes, start_date, end_date, cover_path,
-                       created_at, updated_at
-                FROM works WHERE id = ? AND deleted_at IS NULL
-            """, (work_id,)).fetchone()
+            row = conn.execute("SELECT * FROM works WHERE id = ? AND deleted_at IS NULL", (work_id,)).fetchone()
         return self._row_to_work(row) if row else None
 
     def create(self, name, category="", progress_unit="Página", progress_current=0,
                progress_total=None, status="Quero ler", release_day=None,
+               publication_status=None, release_schedule_type=None, release_days=None,
+               release_month_day=None, release_anchor_date=None, reading_url=None,
                synopsis="", rating=None, favorite=False, personal_notes="",
                start_date=None, end_date=None, cover_path=None):
         name = self._normalize_text(name)
@@ -374,6 +482,18 @@ class SQLiteWorkRepository:
         if status not in self.STATUS_OPTIONS:
             raise ValueError("Status inválido.")
         progress_current, progress_total = self._validate_progress(progress_current, progress_total)
+        publication_status = self._validate_publication_status(publication_status, progress_unit, progress_total)
+        if progress_unit == "Capítulo":
+            if publication_status == "Completo" and progress_total is None:
+                raise ValueError("Informe o total de capítulos para uma obra completa.")
+            if publication_status != "Completo":
+                progress_total = None
+        schedule_type, schedule_days, month_day, anchor_date, legacy_day = self._normalize_release_schedule(
+            release_schedule_type, release_days, release_month_day, release_anchor_date, release_day
+        )
+        if publication_status in ("Completo", "Cancelado"):
+            schedule_type, schedule_days, month_day, anchor_date, legacy_day = "Sem calendário", None, None, None, None
+        reading_url = self._validate_reading_url(reading_url)
         rating = self._validate_rating(rating)
         start_date = self._validate_iso_date(start_date, "Data de início")
         end_date = self._validate_iso_date(end_date, "Data de conclusão")
@@ -385,10 +505,18 @@ class SQLiteWorkRepository:
 
         now = self._utcnow()
         work_id = str(uuid.uuid4())
+        last_release_read_date = (
+            date.today().isoformat()
+            if progress_unit == "Capítulo" and publication_status == "Em lançamento" and schedule_type not in ("Sem calendário", "Irregular")
+            else None
+        )
         work = Work(
             id=work_id, name=name, category=category, progress_unit=progress_unit,
             progress_current=progress_current, progress_total=progress_total,
-            status=status, release_day=normalize_weekday(release_day),
+            status=status, publication_status=publication_status, release_day=legacy_day,
+            release_schedule_type=schedule_type, release_days=schedule_days,
+            release_month_day=month_day, release_anchor_date=anchor_date,
+            last_release_read_date=last_release_read_date, reading_url=reading_url,
             synopsis=synopsis or "", rating=rating, favorite=bool(favorite),
             personal_notes=personal_notes or "", start_date=start_date,
             end_date=end_date, cover_path=self._normalize_cover_path(cover_path),
@@ -396,20 +524,22 @@ class SQLiteWorkRepository:
         )
 
         with self._connect() as conn:
-            self._ensure_category_in_conn(conn, category, now)
+            self._ensure_category_in_conn(conn, category, now, progress_unit)
             conn.execute("""
                 INSERT INTO works (
-                    id, name, category, progress_unit, progress_current,
-                    progress_total, status, release_day, synopsis, rating,
-                    favorite, personal_notes, start_date, end_date, cover_path,
+                    id, name, category, progress_unit, progress_current, progress_total, status,
+                    publication_status, release_day, release_schedule_type, release_days,
+                    release_month_day, release_anchor_date, last_release_read_date, reading_url,
+                    synopsis, rating, favorite, personal_notes, start_date, end_date, cover_path,
                     created_at, updated_at, sync_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_CREATE')
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_CREATE')
             """, (
-                work.id, work.name, work.category, work.progress_unit,
-                work.progress_current, work.progress_total, work.status,
-                work.release_day, work.synopsis, work.rating, int(work.favorite),
-                work.personal_notes, work.start_date, work.end_date, work.cover_path,
-                work.created_at, work.updated_at,
+                work.id, work.name, work.category, work.progress_unit, work.progress_current,
+                work.progress_total, work.status, work.publication_status, work.release_day,
+                work.release_schedule_type, work.release_days, work.release_month_day,
+                work.release_anchor_date, work.last_release_read_date, work.reading_url,
+                work.synopsis, work.rating, int(work.favorite), work.personal_notes,
+                work.start_date, work.end_date, work.cover_path, work.created_at, work.updated_at,
             ))
             if progress_current > 0:
                 self._insert_history(conn, work.id,
@@ -419,6 +549,8 @@ class SQLiteWorkRepository:
 
     def update_work(self, work_id, *, name, category, progress_unit,
                     progress_current, progress_total, status, release_day=None,
+                    publication_status=None, release_schedule_type=None, release_days=None,
+                    release_month_day=None, release_anchor_date=None, reading_url=None,
                     synopsis="", rating=None, favorite=False, personal_notes="",
                     start_date=None, end_date=None):
         name = self._normalize_text(name)
@@ -430,6 +562,18 @@ class SQLiteWorkRepository:
         if status not in self.STATUS_OPTIONS:
             raise ValueError("Status inválido.")
         progress_current, progress_total = self._validate_progress(progress_current, progress_total)
+        publication_status = self._validate_publication_status(publication_status, progress_unit, progress_total)
+        if progress_unit == "Capítulo":
+            if publication_status == "Completo" and progress_total is None:
+                raise ValueError("Informe o total de capítulos para uma obra completa.")
+            if publication_status != "Completo":
+                progress_total = None
+        schedule_type, schedule_days, month_day, anchor_date, legacy_day = self._normalize_release_schedule(
+            release_schedule_type, release_days, release_month_day, release_anchor_date, release_day
+        )
+        if publication_status in ("Completo", "Cancelado"):
+            schedule_type, schedule_days, month_day, anchor_date, legacy_day = "Sem calendário", None, None, None, None
+        reading_url = self._validate_reading_url(reading_url)
         rating = self._validate_rating(rating)
         start_date = self._validate_iso_date(start_date, "Data de início")
         end_date = self._validate_iso_date(end_date, "Data de conclusão")
@@ -444,7 +588,6 @@ class SQLiteWorkRepository:
             if current is None:
                 raise ValueError("Obra não encontrada.")
 
-            # Preserve an existing start date when the form leaves it blank while a work is already underway.
             if not start_date and current["start_date"] and status != "Quero ler":
                 start_date = current["start_date"]
             if not end_date and current["end_date"] and status == "Concluído":
@@ -453,20 +596,33 @@ class SQLiteWorkRepository:
                 status, progress_current, progress_total, start_date, end_date
             )
 
-            self._ensure_category_in_conn(conn, category, now)
+            old_schedule = (
+                current["publication_status"], current["release_schedule_type"], current["release_days"],
+                current["release_month_day"], current["release_anchor_date"]
+            )
+            new_schedule = (publication_status, schedule_type, schedule_days, month_day, anchor_date)
+            last_release_read_date = current["last_release_read_date"]
+            if old_schedule != new_schedule and progress_unit == "Capítulo" and publication_status == "Em lançamento":
+                # Avoid retroactively creating a backlog when the schedule is first configured or changed.
+                last_release_read_date = date.today().isoformat()
+            if publication_status != "Em lançamento":
+                last_release_read_date = current["last_release_read_date"]
+
+            self._ensure_category_in_conn(conn, category, now, progress_unit)
             sync_status = "PENDING_CREATE" if current["sync_status"] == "PENDING_CREATE" else "PENDING_UPDATE"
             conn.execute("""
                 UPDATE works SET
-                    name = ?, category = ?, progress_unit = ?, progress_current = ?,
-                    progress_total = ?, status = ?, release_day = ?, synopsis = ?,
-                    rating = ?, favorite = ?, personal_notes = ?, start_date = ?,
-                    end_date = ?, updated_at = ?, sync_status = ?
+                    name = ?, category = ?, progress_unit = ?, progress_current = ?, progress_total = ?,
+                    status = ?, publication_status = ?, release_day = ?, release_schedule_type = ?,
+                    release_days = ?, release_month_day = ?, release_anchor_date = ?,
+                    last_release_read_date = ?, reading_url = ?, synopsis = ?, rating = ?, favorite = ?,
+                    personal_notes = ?, start_date = ?, end_date = ?, updated_at = ?, sync_status = ?
                 WHERE id = ?
             """, (
-                name, category, progress_unit, progress_current, progress_total,
-                status, normalize_weekday(release_day), synopsis or "",
-                rating, int(bool(favorite)), personal_notes or "", start_date,
-                end_date, now, sync_status, work_id,
+                name, category, progress_unit, progress_current, progress_total, status, publication_status,
+                legacy_day, schedule_type, schedule_days, month_day, anchor_date, last_release_read_date,
+                reading_url, synopsis or "", rating, int(bool(favorite)), personal_notes or "",
+                start_date, end_date, now, sync_status, work_id,
             ))
 
             old_progress = int(current["progress_current"] or 0)
@@ -475,10 +631,174 @@ class SQLiteWorkRepository:
                 self._insert_history(conn, work_id,
                     f"Progresso: {old_progress} → {progress_current}", "progress",
                     delta, progress_unit, now)
+                if delta > 0 and progress_unit == "Capítulo":
+                    self._acknowledge_scheduled_releases_in_conn(conn, work_id, delta, reference=date.today())
             if status != current["status"]:
                 self._insert_history(conn, work_id,
-                    f"Status: {current['status']} → {status}", "status", None,
-                    progress_unit, now)
+                    f"Status: {current['status']} → {status}", "status", None, progress_unit, now)
+            if publication_status != current["publication_status"]:
+                self._insert_history(conn, work_id,
+                    f"Status da obra: {current['publication_status']} → {publication_status}",
+                    "publication_status", None, progress_unit, now)
+
+    def _pending_release_dates_from_row(self, row, reference=None):
+        reference = reference or date.today()
+        if not row or row["progress_unit"] != "Capítulo" or row["publication_status"] != "Em lançamento":
+            return []
+        schedule_type = row["release_schedule_type"] or "Sem calendário"
+        if schedule_type in ("Sem calendário", "Irregular"):
+            return []
+        baseline_raw = row["last_release_read_date"]
+        if baseline_raw:
+            try:
+                baseline = date.fromisoformat(baseline_raw)
+            except ValueError:
+                baseline = reference
+        else:
+            baseline = reference
+        start = baseline + timedelta(days=1)
+        if start > reference:
+            return []
+        return release_dates_between(
+            schedule_type, row["release_days"], row["release_month_day"],
+            row["release_anchor_date"], start, reference
+        )
+
+    def _acknowledge_scheduled_releases_in_conn(self, conn, work_id, amount, reference=None):
+        if amount <= 0:
+            return None
+        row = conn.execute("SELECT * FROM works WHERE id = ? AND deleted_at IS NULL", (work_id,)).fetchone()
+        pending = self._pending_release_dates_from_row(row, reference=reference)
+        if not pending:
+            return None
+        index = min(int(amount), len(pending)) - 1
+        acknowledged = pending[index].isoformat()
+        conn.execute("UPDATE works SET last_release_read_date = ? WHERE id = ?", (acknowledged, work_id))
+        return acknowledged
+
+    def get_release_state(self, work_id, reference=None):
+        reference = reference or date.today()
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM works WHERE id = ? AND deleted_at IS NULL", (work_id,)).fetchone()
+            if row is None:
+                return {"pending_count": 0, "pending_dates": [], "next_release": None}
+            pending = self._pending_release_dates_from_row(row, reference=reference)
+            next_date = None
+            if row["publication_status"] == "Em lançamento":
+                next_date = next_release_date(
+                    row["release_schedule_type"], row["release_days"], row["release_month_day"],
+                    row["release_anchor_date"], from_date=reference
+                )
+            return {
+                "pending_count": len(pending),
+                "pending_dates": [item.isoformat() for item in pending],
+                "oldest_pending": pending[0].isoformat() if pending else None,
+                "latest_pending": pending[-1].isoformat() if pending else None,
+                "next_release": next_date.isoformat() if next_date else None,
+            }
+
+    def list_release_digest(self, reference=None):
+        reference = reference or date.today()
+        result = {"yesterday": [], "today": [], "tomorrow": [], "pending": []}
+        key_by_date = {
+            reference - timedelta(days=1): "yesterday",
+            reference: "today",
+            reference + timedelta(days=1): "tomorrow",
+        }
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM works WHERE deleted_at IS NULL ORDER BY name COLLATE NOCASE").fetchall()
+            for row in rows:
+                if row["publication_status"] != "Em lançamento":
+                    continue
+                dates = release_dates_between(
+                    row["release_schedule_type"], row["release_days"], row["release_month_day"],
+                    row["release_anchor_date"], reference - timedelta(days=1), reference + timedelta(days=1)
+                )
+                for release_date in dates:
+                    key = key_by_date.get(release_date)
+                    if key:
+                        result[key].append({
+                            "work_id": row["id"], "title": row["name"], "date": release_date.isoformat(),
+                            "progress_current": int(row["progress_current"] or 0),
+                        })
+                pending = self._pending_release_dates_from_row(row, reference=reference)
+                if pending:
+                    result["pending"].append({
+                        "work_id": row["id"], "title": row["name"],
+                        "count": len(pending), "since": pending[0].isoformat(),
+                        "latest": pending[-1].isoformat(),
+                    })
+        return result
+
+    def apply_inactivity_rules(self, days=30, reference=None):
+        try:
+            days = int(days)
+        except (TypeError, ValueError):
+            days = 30
+        if days <= 0:
+            return 0
+        reference = reference or date.today()
+        cutoff = reference - timedelta(days=days)
+        changed = 0
+        now = self._utcnow()
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT * FROM works
+                WHERE deleted_at IS NULL AND status = 'Lendo' AND progress_unit = 'Capítulo'
+            """).fetchall()
+            for row in rows:
+                history = conn.execute("""
+                    SELECT created_at FROM history
+                    WHERE work_id = ? AND event_type = 'progress' AND COALESCE(delta, 0) > 0
+                    ORDER BY created_at DESC LIMIT 1
+                """, (row["id"],)).fetchone()
+                raw = history["created_at"] if history else (row["start_date"] or row["created_at"])
+                try:
+                    last = datetime.fromisoformat(raw).date() if "T" in str(raw) else date.fromisoformat(str(raw)[:10])
+                except (TypeError, ValueError):
+                    continue
+                if last > cutoff:
+                    continue
+                sync_status = "PENDING_CREATE" if row["sync_status"] == "PENDING_CREATE" else "PENDING_UPDATE"
+                conn.execute("""
+                    UPDATE works SET status = 'Pausado', updated_at = ?, sync_status = ? WHERE id = ?
+                """, (now, sync_status, row["id"]))
+                self._insert_history(
+                    conn, row["id"], f"Status automático: Lendo → Pausado ({days} dias sem progresso)",
+                    "status", None, row["progress_unit"], now
+                )
+                changed += 1
+        return changed
+
+    def set_reading_status(self, work_id, status):
+        if status not in self.STATUS_OPTIONS:
+            raise ValueError("Status inválido.")
+        work = self.get_by_id(work_id)
+        if not work:
+            raise ValueError("Obra não encontrada.")
+        self.update_work(
+            work_id, name=work.name, category=work.category, progress_unit=work.progress_unit,
+            progress_current=work.progress_current, progress_total=work.progress_total, status=status,
+            publication_status=work.publication_status, release_schedule_type=work.release_schedule_type,
+            release_days=work.release_days, release_month_day=work.release_month_day,
+            release_anchor_date=work.release_anchor_date, reading_url=work.reading_url,
+            synopsis=work.synopsis, rating=work.rating, favorite=work.favorite,
+            personal_notes=work.personal_notes, start_date=work.start_date, end_date=work.end_date,
+        )
+
+    def set_publication_status(self, work_id, publication_status):
+        work = self.get_by_id(work_id)
+        if not work:
+            raise ValueError("Obra não encontrada.")
+        self.update_work(
+            work_id, name=work.name, category=work.category, progress_unit=work.progress_unit,
+            progress_current=work.progress_current, progress_total=work.progress_total, status=work.status,
+            publication_status=publication_status, release_schedule_type=work.release_schedule_type,
+            release_days=work.release_days, release_month_day=work.release_month_day,
+            release_anchor_date=work.release_anchor_date, reading_url=work.reading_url,
+            synopsis=work.synopsis, rating=work.rating, favorite=work.favorite,
+            personal_notes=work.personal_notes, start_date=work.start_date, end_date=work.end_date,
+        )
 
     def delete_work(self, work_id):
         now = self._utcnow()
@@ -543,9 +863,12 @@ class SQLiteWorkRepository:
                 UPDATE works SET progress_current = ?, status = ?, start_date = ?, end_date = ?,
                                  updated_at = ?, sync_status = ? WHERE id = ?
             """, (new_value, status, start_date, end_date, now, next_sync, work_id))
+            delta = new_value - old_value
             self._insert_history(conn, work_id,
                 f"Progresso: {old_value} → {new_value}", "progress",
-                new_value - old_value, row["progress_unit"], now)
+                delta, row["progress_unit"], now)
+            if delta > 0 and row["progress_unit"] == "Capítulo":
+                self._acknowledge_scheduled_releases_in_conn(conn, work_id, delta, reference=date.today())
             if status != row["status"]:
                 self._insert_history(conn, work_id,
                     f"Status: {row['status']} → {status}", "status", None,
@@ -668,58 +991,79 @@ class SQLiteWorkRepository:
             conn.execute("UPDATE works SET updated_at = ?, sync_status = ? WHERE id = ?",
                          (self._utcnow(), sync_status, work_id))
 
-    def _ensure_category_in_conn(self, conn, category, now=None):
+    def _ensure_category_in_conn(self, conn, category, now=None, progress_unit="Página"):
         category = self._normalize_text(category)
         if not category:
             return
         now = now or self._utcnow()
+        progress_unit = progress_unit if progress_unit in self.PROGRESS_UNITS else 'Página'
         row = conn.execute(
             "SELECT * FROM categories WHERE name = ? COLLATE NOCASE", (category,)
         ).fetchone()
         if row is None:
             conn.execute("""
-                INSERT INTO categories (name, created_at, id, updated_at, deleted_at, sync_status)
-                VALUES (?, ?, ?, ?, NULL, 'PENDING_CREATE')
-            """, (category, now, str(uuid.uuid4()), now))
-        elif row["deleted_at"]:
+                INSERT INTO categories (name, created_at, id, updated_at, deleted_at, sync_status, progress_unit)
+                VALUES (?, ?, ?, ?, NULL, 'PENDING_CREATE', ?)
+            """, (category, now, str(uuid.uuid4()), now, progress_unit))
+        else:
             next_sync = "PENDING_CREATE" if row["sync_status"] == "PENDING_CREATE" else "PENDING_UPDATE"
-            conn.execute("""
-                UPDATE categories SET deleted_at = NULL, updated_at = ?, sync_status = ?
-                WHERE name = ? COLLATE NOCASE
-            """, (now, next_sync, category))
+            updates = []
+            params = []
+            if row["deleted_at"]:
+                updates.append("deleted_at = NULL")
+            if (row["progress_unit"] or 'Página') != progress_unit:
+                updates.append("progress_unit = ?")
+                params.append(progress_unit)
+            if row["deleted_at"] or updates:
+                updates.extend(["updated_at = ?", "sync_status = ?"])
+                params.extend([now, next_sync, category])
+                conn.execute(
+                    f"UPDATE categories SET {', '.join(updates)} WHERE name = ? COLLATE NOCASE",
+                    tuple(params)
+                )
 
     def list_categories(self):
         with self._connect() as conn:
             rows = conn.execute("""
-                SELECT c.name, COUNT(CASE WHEN w.deleted_at IS NULL THEN w.id END) AS work_count
+                SELECT c.name, c.progress_unit, COUNT(CASE WHEN w.deleted_at IS NULL THEN w.id END) AS work_count
                 FROM categories c
                 LEFT JOIN works w ON w.category = c.name COLLATE NOCASE
                 WHERE c.deleted_at IS NULL
-                GROUP BY c.name
+                GROUP BY c.name, c.progress_unit
                 ORDER BY c.name COLLATE NOCASE
             """).fetchall()
         return [dict(row) for row in rows]
 
-    def create_category(self, name):
+    def get_category(self, name):
+        name = self._normalize_text(name)
+        if not name:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT name, progress_unit, created_at FROM categories WHERE name = ? COLLATE NOCASE AND deleted_at IS NULL",
+                (name,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def create_category(self, name, progress_unit="Página"):
         name = self._normalize_text(name)
         if not name:
             raise ValueError("Informe o nome da categoria.")
         with self._connect() as conn:
-            self._ensure_category_in_conn(conn, name)
+            self._ensure_category_in_conn(conn, name, progress_unit=progress_unit)
             row = conn.execute(
                 "SELECT name FROM categories WHERE name = ? COLLATE NOCASE AND deleted_at IS NULL", (name,)
             ).fetchone()
         return row["name"]
 
-    def rename_category(self, old_name, new_name):
+    def rename_category(self, old_name, new_name, progress_unit=None):
         old_name = self._normalize_text(old_name)
         new_name = self._normalize_text(new_name)
         if not old_name:
             raise ValueError("Categoria de origem inválida.")
         if not new_name:
             raise ValueError("Informe o novo nome da categoria.")
-        if old_name.casefold() == new_name.casefold():
-            return
+        rename_only_case = old_name.casefold() == new_name.casefold()
         now = self._utcnow()
         with self._connect() as conn:
             row = conn.execute(
@@ -727,15 +1071,16 @@ class SQLiteWorkRepository:
             ).fetchone()
             if row is None:
                 raise ValueError("Categoria não encontrada.")
-            if conn.execute(
+            if not rename_only_case and conn.execute(
                 "SELECT 1 FROM categories WHERE name = ? COLLATE NOCASE AND deleted_at IS NULL", (new_name,)
             ).fetchone():
                 raise ValueError("Já existe uma categoria com esse nome.")
             category_sync = "PENDING_CREATE" if row["sync_status"] == "PENDING_CREATE" else "PENDING_UPDATE"
+            progress_unit = progress_unit if progress_unit in self.PROGRESS_UNITS else (row["progress_unit"] or 'Página')
             conn.execute("""
-                UPDATE categories SET name = ?, updated_at = ?, sync_status = ?
+                UPDATE categories SET name = ?, progress_unit = ?, updated_at = ?, sync_status = ?
                 WHERE name = ? COLLATE NOCASE
-            """, (new_name, now, category_sync, old_name))
+            """, (new_name, progress_unit, now, category_sync, old_name))
             conn.execute("""
                 UPDATE works SET category = ?, updated_at = ?,
                     sync_status = CASE WHEN sync_status = 'PENDING_CREATE' THEN 'PENDING_CREATE' ELSE 'PENDING_UPDATE' END
@@ -882,23 +1227,27 @@ class SQLiteWorkRepository:
         with self._connect() as conn:
             conn.execute("UPDATE goals SET current_value = ? WHERE id = ?", (int(current_value), goal_id))
 
-    def list_calendar_events(self):
+    def list_calendar_events(self, reference=None, horizon_days=60):
+        reference = reference or date.today()
         events = []
         for work in self.list_all():
             if work.start_date:
                 events.append({"date": work.start_date, "type": "Início", "title": work.name, "work_id": work.id})
             if work.end_date:
                 events.append({"date": work.end_date, "type": "Conclusão", "title": work.name, "work_id": work.id})
-            if work.progress_unit == "Capítulo" and work.progress_total is None and work.release_day:
-                predicted = next_weekday_date(work.release_day)
-                if predicted:
+            if work.publication_status == "Em lançamento":
+                predicted = next_release_date(
+                    work.release_schedule_type, work.release_days, work.release_month_day,
+                    work.release_anchor_date, from_date=reference
+                )
+                if predicted and predicted <= reference + timedelta(days=max(1, int(horizon_days))):
                     events.append({
                         "date": predicted.isoformat(),
                         "type": "Próximo lançamento",
                         "title": work.name,
                         "work_id": work.id,
                     })
-        return sorted(events, key=lambda item: (item["date"], item["title"].casefold()))
+        return sorted(events, key=lambda item: (item["date"], item["title"].casefold(), item["type"]))
 
     def list_history(self, limit=500):
         with self._connect() as conn:
@@ -952,12 +1301,13 @@ class SQLiteWorkRepository:
                     continue
                 conn.execute("""
                     INSERT OR IGNORE INTO categories
-                    (name, created_at, id, updated_at, deleted_at, sync_status)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    (name, created_at, id, updated_at, deleted_at, sync_status, progress_unit)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, (
                     name, item.get("created_at") or now, item.get("id") or str(uuid.uuid4()),
                     item.get("updated_at") or item.get("created_at") or now,
                     item.get("deleted_at"), item.get("sync_status", "PENDING_CREATE"),
+                    item.get("progress_unit") if item.get("progress_unit") in self.PROGRESS_UNITS else "Página",
                 ))
 
             work_ids = set()
@@ -967,25 +1317,37 @@ class SQLiteWorkRepository:
                 if not name:
                     raise ValueError("Backup contém obra sem nome.")
                 category = self._normalize_text(item.get("category"))
+                progress_unit = item.get("progress_unit") if item.get("progress_unit") in self.PROGRESS_UNITS else "Página"
                 if not item.get("deleted_at"):
-                    self._ensure_category_in_conn(conn, category, now)
+                    self._ensure_category_in_conn(conn, category, now, progress_unit)
                 cover_path = self._normalize_cover_path(item.get("cover_path"))
                 if cover_path and not Path(cover_path).exists():
                     cover_path = None
+                progress_total = item.get("progress_total")
+                publication_status = item.get("publication_status") or (
+                    "Em lançamento" if progress_unit == "Capítulo" and progress_total in (None, "") else "Completo"
+                )
+                release_schedule_type = item.get("release_schedule_type") or ("Semanal" if item.get("release_day") else "Sem calendário")
+                release_days = item.get("release_days") or item.get("release_day")
                 conn.execute("""
                     INSERT INTO works (
-                        id, name, category, progress_unit, progress_current, progress_total,
-                        status, release_day, synopsis, rating, favorite, personal_notes,
-                        start_date, end_date, cover_path, cover_remote_id, cover_remote_name, cover_remote_modified, cover_deleted,
+                        id, name, category, progress_unit, progress_current, progress_total, status,
+                        publication_status, release_day, release_schedule_type, release_days,
+                        release_month_day, release_anchor_date, last_release_read_date, reading_url,
+                        synopsis, rating, favorite, personal_notes, start_date, end_date, cover_path,
+                        cover_remote_id, cover_remote_name, cover_remote_modified, cover_deleted,
                         created_at, updated_at, deleted_at, sync_status
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    work_id, name, category, item.get("progress_unit", "Página"),
-                    int(item.get("progress_current", 0) or 0), item.get("progress_total"),
-                    item.get("status", "Quero ler"), item.get("release_day"), item.get("synopsis", ""),
-                    item.get("rating"), int(bool(item.get("favorite", 0))), item.get("personal_notes", ""),
-                    item.get("start_date"), item.get("end_date"), cover_path,
-                    item.get("cover_remote_id"), item.get("cover_remote_name"), item.get("cover_remote_modified"),
+                    work_id, name, category, progress_unit,
+                    int(item.get("progress_current", 0) or 0), progress_total, item.get("status", "Quero ler"),
+                    publication_status, normalize_weekday(item.get("release_day")), release_schedule_type,
+                    serialize_release_days(release_days) or None, item.get("release_month_day"),
+                    item.get("release_anchor_date"), item.get("last_release_read_date"),
+                    item.get("reading_url"), item.get("synopsis", ""), item.get("rating"),
+                    int(bool(item.get("favorite", 0))), item.get("personal_notes", ""),
+                    item.get("start_date"), item.get("end_date"), cover_path, item.get("cover_remote_id"),
+                    item.get("cover_remote_name"), item.get("cover_remote_modified"),
                     int(bool(item.get("cover_deleted", 0))), item.get("created_at") or now, item.get("updated_at") or now,
                     item.get("deleted_at"), item.get("sync_status", "PENDING_CREATE"),
                 ))
@@ -1040,7 +1402,7 @@ class SQLiteWorkRepository:
                 item.pop("cover_deleted", None)
                 works.append(item)
             categories = [dict(row) for row in conn.execute("""
-                SELECT id, name, created_at, updated_at, deleted_at FROM categories
+                SELECT id, name, created_at, updated_at, deleted_at, progress_unit FROM categories
             """).fetchall()]
             goal_rows = conn.execute("""
                 SELECT id, title, goal_type, target_value, current_value, start_date, end_date,
@@ -1082,10 +1444,11 @@ class SQLiteWorkRepository:
                         local = collision
                 if local is None:
                     conn.execute("""
-                        INSERT INTO categories (name, created_at, id, updated_at, deleted_at, sync_status)
-                        VALUES (?, ?, ?, ?, ?, 'SYNCED')
+                        INSERT INTO categories (name, created_at, id, updated_at, deleted_at, sync_status, progress_unit)
+                        VALUES (?, ?, ?, ?, ?, 'SYNCED', ?)
                     """, (name, item.get("created_at") or now, category_id,
-                          item.get("updated_at") or item.get("created_at") or now, item.get("deleted_at")))
+                          item.get("updated_at") or item.get("created_at") or now, item.get("deleted_at"),
+                          item.get("progress_unit") if item.get("progress_unit") in self.PROGRESS_UNITS else "Página"))
                     downloaded += 1
                 elif self._remote_is_newer(item.get("updated_at"), local["updated_at"]):
                     # Avoid violating the name primary key on a remote rename collision.
@@ -1094,10 +1457,10 @@ class SQLiteWorkRepository:
                     ).fetchone()
                     if not collision:
                         conn.execute("""
-                            UPDATE categories SET name = ?, created_at = ?, updated_at = ?, deleted_at = ?, sync_status = 'SYNCED'
+                            UPDATE categories SET name = ?, created_at = ?, updated_at = ?, deleted_at = ?, progress_unit = ?, sync_status = 'SYNCED'
                             WHERE id = ?
                         """, (name, item.get("created_at") or local["created_at"], item.get("updated_at") or now,
-                              item.get("deleted_at"), local["id"]))
+                              item.get("deleted_at"), item.get("progress_unit") if item.get("progress_unit") in self.PROGRESS_UNITS else "Página", local["id"]))
                         downloaded += 1
 
             for item in payload.get("works", []):
@@ -1108,7 +1471,8 @@ class SQLiteWorkRepository:
                 if local is not None and not self._remote_is_newer(item.get("updated_at"), local["updated_at"]):
                     continue
                 category = self._normalize_text(item.get("category"))
-                self._ensure_category_in_conn(conn, category, item.get("updated_at") or now)
+                progress_unit = item.get("progress_unit") if item.get("progress_unit") in self.PROGRESS_UNITS else "Página"
+                self._ensure_category_in_conn(conn, category, item.get("updated_at") or now, progress_unit)
                 existing_cover_path = local["cover_path"] if local else None
                 same_remote_cover = bool(
                     local
@@ -1127,6 +1491,25 @@ class SQLiteWorkRepository:
                 except ValueError:
                     progress_current, progress_total = 0, None
                 try:
+                    publication_status = self._validate_publication_status(
+                        item.get("publication_status"), progress_unit, progress_total
+                    )
+                except ValueError:
+                    publication_status = "Em lançamento" if progress_unit == "Capítulo" and progress_total is None else "Completo"
+                try:
+                    schedule_type, schedule_days, month_day, anchor_date, legacy_day = self._normalize_release_schedule(
+                        item.get("release_schedule_type"), item.get("release_days"), item.get("release_month_day"),
+                        item.get("release_anchor_date"), item.get("release_day")
+                    )
+                except ValueError:
+                    schedule_type, schedule_days, month_day, anchor_date, legacy_day = "Sem calendário", None, None, None, None
+                if publication_status in ("Completo", "Cancelado"):
+                    schedule_type, schedule_days, month_day, anchor_date, legacy_day = "Sem calendário", None, None, None, None
+                try:
+                    reading_url = self._validate_reading_url(item.get("reading_url"))
+                except ValueError:
+                    reading_url = None
+                try:
                     rating = self._validate_rating(item.get("rating"))
                 except ValueError:
                     rating = None
@@ -1138,33 +1521,41 @@ class SQLiteWorkRepository:
                     end_date = self._validate_iso_date(item.get("end_date"), "Data de conclusão")
                 except ValueError:
                     end_date = None
+                try:
+                    last_release_read_date = self._validate_iso_date(item.get("last_release_read_date"), "Último lançamento lido")
+                except ValueError:
+                    last_release_read_date = None
                 status, progress_current, start_date, end_date = self._normalize_reading_state(
                     status, progress_current, progress_total, start_date, end_date
                 )
 
                 values = (
-                    self._normalize_text(item.get("name")), category, progress_unit,
-                    progress_current, progress_total, status, item.get("release_day"), item.get("synopsis", ""),
-                    rating, int(bool(item.get("favorite", False))), item.get("personal_notes", ""),
-                    start_date, end_date, cover_path, item.get("cover_remote_id"), item.get("cover_filename"),
+                    self._normalize_text(item.get("name")), category, progress_unit, progress_current, progress_total,
+                    status, publication_status, legacy_day, schedule_type, schedule_days, month_day, anchor_date,
+                    last_release_read_date, reading_url, item.get("synopsis", ""), rating,
+                    int(bool(item.get("favorite", False))), item.get("personal_notes", ""), start_date, end_date,
+                    cover_path, item.get("cover_remote_id"), item.get("cover_filename"),
                     item.get("cover_remote_modified"), item.get("created_at") or now, item.get("updated_at") or now,
                     item.get("deleted_at"),
                 )
                 if local is None:
                     conn.execute("""
                         INSERT INTO works (
-                            id, name, category, progress_unit, progress_current, progress_total,
-                            status, release_day, synopsis, rating, favorite, personal_notes,
-                            start_date, end_date, cover_path, cover_remote_id, cover_remote_name, cover_remote_modified, cover_deleted,
-                            created_at, updated_at, deleted_at, sync_status
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 'SYNCED')
+                            id, name, category, progress_unit, progress_current, progress_total, status,
+                            publication_status, release_day, release_schedule_type, release_days, release_month_day,
+                            release_anchor_date, last_release_read_date, reading_url, synopsis, rating, favorite,
+                            personal_notes, start_date, end_date, cover_path, cover_remote_id, cover_remote_name,
+                            cover_remote_modified, cover_deleted, created_at, updated_at, deleted_at, sync_status
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 'SYNCED')
                     """, (work_id,) + values)
                 else:
                     conn.execute("""
                         UPDATE works SET name = ?, category = ?, progress_unit = ?, progress_current = ?, progress_total = ?,
-                            status = ?, release_day = ?, synopsis = ?, rating = ?, favorite = ?, personal_notes = ?,
-                            start_date = ?, end_date = ?, cover_path = ?, cover_remote_id = ?, cover_remote_name = ?,
-                            cover_remote_modified = ?, cover_deleted = 0, created_at = ?, updated_at = ?, deleted_at = ?, sync_status = 'SYNCED'
+                            status = ?, publication_status = ?, release_day = ?, release_schedule_type = ?, release_days = ?,
+                            release_month_day = ?, release_anchor_date = ?, last_release_read_date = ?, reading_url = ?,
+                            synopsis = ?, rating = ?, favorite = ?, personal_notes = ?, start_date = ?, end_date = ?,
+                            cover_path = ?, cover_remote_id = ?, cover_remote_name = ?, cover_remote_modified = ?,
+                            cover_deleted = 0, created_at = ?, updated_at = ?, deleted_at = ?, sync_status = 'SYNCED'
                         WHERE id = ?
                     """, values + (work_id,))
                 conn.execute("DELETE FROM work_tags WHERE work_id = ?", (work_id,))
@@ -1224,7 +1615,12 @@ class SQLiteWorkRepository:
                 WHERE deleted_at IS NULL AND TRIM(category) <> ''
             """).fetchall()
             for category_row in active_categories:
-                self._ensure_category_in_conn(conn, category_row["name"], now)
+                unit_row = conn.execute(
+                    "SELECT progress_unit FROM works WHERE deleted_at IS NULL AND TRIM(category) = ? ORDER BY updated_at DESC LIMIT 1",
+                    (category_row["name"],),
+                ).fetchone()
+                inferred_unit = unit_row["progress_unit"] if unit_row and unit_row["progress_unit"] in self.PROGRESS_UNITS else "Página"
+                self._ensure_category_in_conn(conn, category_row["name"], now, inferred_unit)
 
         return {"downloaded": downloaded}
 

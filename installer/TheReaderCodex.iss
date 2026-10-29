@@ -1,5 +1,5 @@
 #define MyAppName "The Reader Codex"
-#define MyAppVersion "1.3.0"
+#define MyAppVersion "2.0.0"
 #define MyAppPublisher "The Reader Codex"
 #define MyAppExeName "TheReaderCodex.exe"
 

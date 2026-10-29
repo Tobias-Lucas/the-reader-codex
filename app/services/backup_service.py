@@ -19,6 +19,14 @@ class BackupService:
         self.max_backups = int(max_backups)
         Path(self.backup_dir).mkdir(parents=True, exist_ok=True)
 
+    def _is_supported_schema_version(self, version):
+        try:
+            version = int(version)
+        except (TypeError, ValueError):
+            return False
+        current = int(getattr(self.repository, "SCHEMA_VERSION", 1))
+        return 1 <= version <= current
+
     def export_json(self, file_path):
         payload = self.repository.export_payload()
         payload["exported_at"] = datetime.now().isoformat()
@@ -30,7 +38,7 @@ class BackupService:
         with open(file_path, "r", encoding="utf-8") as f:
             payload = json.load(f)
         version = payload.get("schema_version")
-        if version not in (1, 2, 3, 4, 5):
+        if not self._is_supported_schema_version(version):
             raise ValueError("Versão de backup não suportada.")
         self.repository.replace_from_payload(payload)
         self.repository.prune_orphan_covers()
@@ -84,7 +92,7 @@ class BackupService:
             if not json_path.is_file():
                 raise ValueError("Backup completo inválido: library.json não encontrado.")
             payload = json.loads(json_path.read_text(encoding="utf-8"))
-            if payload.get("schema_version") not in (1, 2, 3, 4, 5):
+            if not self._is_supported_schema_version(payload.get("schema_version")):
                 raise ValueError("Versão de backup não suportada.")
 
             self.covers_dir.mkdir(parents=True, exist_ok=True)

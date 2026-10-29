@@ -1,13 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all
-
 project_dir = Path(SPECPATH).resolve()
 
 datas = [(str(project_dir / "assets"), "assets")]
-binaries = []
 hiddenimports = [
+    "PySide6.QtCore",
+    "PySide6.QtGui",
+    "PySide6.QtWidgets",
+    "PySide6.QtSvg",
     "googleapiclient.discovery",
     "googleapiclient.http",
     "google.auth.transport.requests",
@@ -16,21 +17,16 @@ hiddenimports = [
     "google_auth_oauthlib.flow",
 ]
 
-ctk_datas, ctk_binaries, ctk_hidden = collect_all("customtkinter")
-datas += ctk_datas
-binaries += ctk_binaries
-hiddenimports += ctk_hidden
-
 analysis = Analysis(
     [str(project_dir / "main.py")],
     pathex=[str(project_dir)],
-    binaries=binaries,
+    binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["pytest"],
+    excludes=["pytest", "tkinter"],
     noarchive=False,
 )
 
